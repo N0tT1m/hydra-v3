@@ -1,7 +1,10 @@
 # Run the Hydra coordinator (Windows PowerShell)
 
 param(
-    [string]$ConfigFile = "config.toml"
+    [string]$ConfigFile = "config.toml",
+    [switch]$WithLocalWorker,
+    [string]$WorkerNodeId = "local-worker",
+    [string]$WorkerDevice = "auto"
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,12 +66,26 @@ Write-Host "  HTTP API: http://localhost:8080" -ForegroundColor Cyan
 Write-Host "  ZMQ Router: tcp://*:5555" -ForegroundColor Cyan
 Write-Host "  ZMQ Metrics: tcp://*:5556" -ForegroundColor Cyan
 Write-Host "  ZMQ Broadcast: tcp://*:5557" -ForegroundColor Cyan
+if ($WithLocalWorker) {
+    Write-Host "  Local Worker: $WorkerNodeId ($WorkerDevice)" -ForegroundColor Cyan
+}
 Write-Host ""
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 Write-Host ""
 
+# Build argument list
+$args = @()
 if ($ConfigFile) {
-    & .\build\bin\hydra.exe -config $ConfigFile
+    $args += "-config", $ConfigFile
+}
+if ($WithLocalWorker) {
+    $args += "-with-local-worker"
+    $args += "-worker-node-id", $WorkerNodeId
+    $args += "-worker-device", $WorkerDevice
+}
+
+if ($args.Count -gt 0) {
+    & .\build\bin\hydra.exe @args
 } else {
     & .\build\bin\hydra.exe
 }

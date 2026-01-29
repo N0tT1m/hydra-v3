@@ -199,21 +199,42 @@ class DistributedWorker:
         """Main event loop."""
         log.info("Entering event loop")
 
+        # Start heartbeat task
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+        try:
+            while self.running:
+                try:
+                    msg = await self.zmq_handler.receive(timeout=0.1)
+                    if msg:
+                        await self._handle_message(msg)
+
+                    # Check broadcasts
+                    broadcast = await self.zmq_handler.check_broadcast()
+                    if broadcast:
+                        await self._handle_broadcast(broadcast)
+
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    log.error("Event loop error", error=str(e))
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeats to coordinator."""
         while self.running:
             try:
-                msg = await self.zmq_handler.receive(timeout=0.1)
-                if msg:
-                    await self._handle_message(msg)
-
-                # Check broadcasts
-                broadcast = await self.zmq_handler.check_broadcast()
-                if broadcast:
-                    await self._handle_broadcast(broadcast)
-
+                await self._handle_health_check()
+                await asyncio.sleep(0.5)  # 500ms heartbeat interval
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                log.error("Event loop error", error=str(e))
+                log.warning("Heartbeat failed", error=str(e))
 
     async def _handle_message(self, msg: Dict[str, Any]):
         """Handle incoming message."""

@@ -4,7 +4,10 @@ import (
 	"context"
 	"flag"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"syscall"
 
 	"github.com/hydra-v3/internal/api"
@@ -18,6 +21,9 @@ import (
 func main() {
 	// Parse flags
 	configPath := flag.String("config", "config.toml", "Path to configuration file")
+	withLocalWorker := flag.Bool("with-local-worker", false, "Start a local Python worker")
+	workerNodeID := flag.String("worker-node-id", "local-worker", "Node ID for local worker")
+	workerDevice := flag.String("worker-device", "auto", "Device for local worker (auto, cuda:0, mps, cpu)")
 	flag.Parse()
 
 	// Setup logging
@@ -66,11 +72,125 @@ func main() {
 
 	log.Info().Msg("Hydra coordinator started successfully")
 
+	// Start local worker if requested
+	var workerCmd *exec.Cmd
+	if *withLocalWorker {
+		workerCmd = startLocalWorker(*workerNodeID, *workerDevice, cfg.ZMQ.RouterAddr)
+	}
+
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
 
 	log.Info().Msg("Shutting down...")
+
+	// Stop local worker if running
+	if workerCmd != nil && workerCmd.Process != nil {
+		log.Info().Msg("Stopping local worker...")
+		workerCmd.Process.Signal(syscall.SIGTERM)
+		workerCmd.Wait()
+	}
+
 	cancel()
+}
+
+// startLocalWorker spawns a local Python worker process
+func startLocalWorker(nodeID, device, coordinatorAddr string) *exec.Cmd {
+	log.Info().
+		Str("node_id", nodeID).
+		Str("device", device).
+		Msg("Starting local worker")
+
+	// Find the worker directory
+	workerDir := findWorkerDir()
+	if workerDir == "" {
+		log.Error().Msg("Could not find worker directory")
+		return nil
+	}
+
+	// Determine Python executable path
+	var pythonPath string
+	if runtime.GOOS == "windows" {
+		pythonPath = filepath.Join(workerDir, "venv", "Scripts", "python.exe")
+	} else {
+		pythonPath = filepath.Join(workerDir, "venv", "bin", "python")
+	}
+
+	// Check if venv exists
+	if _, err := os.Stat(pythonPath); os.IsNotExist(err) {
+		// Fall back to system python
+		pythonPath = "python"
+		if runtime.GOOS != "windows" {
+			pythonPath = "python3"
+		}
+		log.Warn().Msg("Worker venv not found, using system Python")
+	}
+
+	// Convert coordinator address for worker (tcp://*:5555 -> tcp://localhost:5555)
+	workerCoordAddr := coordinatorAddr
+	if workerCoordAddr == "tcp://*:5555" {
+		workerCoordAddr = "tcp://localhost:5555"
+	}
+
+	// Build command
+	cmd := exec.Command(
+		pythonPath, "-m", "hydra_worker",
+		"start",
+		"--node-id", nodeID,
+		"--coordinator", workerCoordAddr,
+		"--device", device,
+	)
+
+	cmd.Dir = workerDir
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// Start the process
+	if err := cmd.Start(); err != nil {
+		log.Error().Err(err).Msg("Failed to start local worker")
+		return nil
+	}
+
+	log.Info().Int("pid", cmd.Process.Pid).Msg("Local worker started")
+	return cmd
+}
+
+// findWorkerDir locates the worker directory relative to the executable
+func findWorkerDir() string {
+	// Try relative to executable
+	execPath, err := os.Executable()
+	if err == nil {
+		// Check ../../../worker (from build/bin/hydra)
+		dir := filepath.Join(filepath.Dir(execPath), "..", "..", "worker")
+		if _, err := os.Stat(dir); err == nil {
+			return filepath.Clean(dir)
+		}
+	}
+
+	// Try current working directory
+	cwd, err := os.Getwd()
+	if err == nil {
+		dir := filepath.Join(cwd, "worker")
+		if _, err := os.Stat(dir); err == nil {
+			return dir
+		}
+	}
+
+	// Try relative paths
+	candidates := []string{
+		"worker",
+		"../worker",
+		"../../worker",
+	}
+
+	for _, candidate := range candidates {
+		if abs, err := filepath.Abs(candidate); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				return abs
+			}
+		}
+	}
+
+	return ""
 }
