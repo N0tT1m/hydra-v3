@@ -1,0 +1,29 @@
+# Hydra V3 Configuration
+
+[server]
+http_addr = "0.0.0.0:8080"
+metrics_addr = "0.0.0.0:9090"
+
+[cluster]
+node_id = "coordinator"
+heartbeat_interval = "500ms"
+unhealthy_threshold = 3
+reserved_vram_gb = 2.0
+memory_per_layer_gb = 0.5
+
+[auth]
+enabled = false
+api_keys = []
+rate_limit = 100
+rate_window = "1m"
+
+[zmq]
+router_addr = "tcp://*:5555"
+metrics_addr = "tcp://*:5556"
+broadcast_addr = "tcp://*:5557"
+high_water_mark = 1000
+
+[model]
+cache_dir = "~/.cache/hydra/models"
+# hf_token = "your_huggingface_token"
+max_cache_gb = 100

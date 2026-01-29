@@ -1,0 +1,384 @@
+"""Distributed worker - combines partial model loading with pipeline forwarding."""
+
+import asyncio
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Any
+import torch
+import structlog
+
+from hydra_worker.core.device import MemoryTracker, detect_device
+from hydra_worker.models.partial_loader import PartialModelLoader, PartialTransformer
+from hydra_worker.distributed.pipeline import (
+    PipelineNode,
+    PipelineConfig,
+    PipelinePosition,
+)
+from hydra_worker.comm.zmq_handler import ZMQHandler
+
+log = structlog.get_logger()
+
+
+@dataclass
+class DistributedWorkerConfig:
+    """Configuration for distributed worker."""
+    node_id: str
+    coordinator_addr: str
+    device: str = "auto"
+    dtype: str = "float16"
+    pipeline_port: int = 6000
+
+
+class DistributedWorker:
+    """
+    A distributed worker that loads partial models and participates in pipeline.
+
+    Usage:
+        config = DistributedWorkerConfig(
+            node_id="worker-1",
+            coordinator_addr="tcp://coordinator:5555",
+        )
+        worker = DistributedWorker(config)
+        await worker.start()
+    """
+
+    def __init__(self, config: DistributedWorkerConfig):
+        self.config = config
+        self.device = self._get_device()
+        self.dtype = self._get_dtype()
+
+        self.memory_tracker = MemoryTracker(self.device)
+        self.zmq_handler: Optional[ZMQHandler] = None
+
+        # Model components
+        self.model: Optional[PartialTransformer] = None
+        self.tokenizer = None
+        self.pipeline_node: Optional[PipelineNode] = None
+
+        # Assignment
+        self.layer_start: Optional[int] = None
+        self.layer_end: Optional[int] = None
+        self.position: Optional[PipelinePosition] = None
+
+        self.running = False
+
+    def _get_device(self) -> torch.device:
+        if self.config.device == "auto":
+            info = detect_device()
+            return torch.device(f"{info.device_type}:{info.device_index}" if info.device_type != "cpu" else "cpu")
+        return torch.device(self.config.device)
+
+    def _get_dtype(self) -> torch.dtype:
+        return {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }.get(self.config.dtype, torch.float16)
+
+    async def start(self):
+        """Start the worker and connect to coordinator."""
+        log.info("Starting distributed worker", node_id=self.config.node_id)
+
+        # Connect to coordinator
+        self.zmq_handler = ZMQHandler(
+            worker_id=self.config.node_id,
+            coordinator_address=self.config.coordinator_addr,
+            pipeline_port_base=self.config.pipeline_port,
+        )
+        await self.zmq_handler.connect()
+
+        # Register with coordinator
+        await self._register()
+
+        # Wait for topology assignment
+        await self._wait_for_assignment()
+
+        self.running = True
+
+        # Start event loop
+        await self._event_loop()
+
+    async def _register(self):
+        """Register with coordinator."""
+        device_info = self.memory_tracker.get_device_info()
+
+        await self.zmq_handler.send({
+            "type": "register",
+            "node_id": self.config.node_id,
+            "host": "localhost",  # TODO: Get actual host
+            "pipeline_port": self.config.pipeline_port,
+            "vram_gb": device_info.total_memory / (1024**3),
+            "capabilities": ["cuda" if self.device.type == "cuda" else self.device.type],
+        })
+
+        log.info("Registered with coordinator")
+
+    async def _wait_for_assignment(self):
+        """Wait for layer assignment from coordinator."""
+        log.info("Waiting for layer assignment...")
+
+        while True:
+            msg = await self.zmq_handler.receive(timeout=5.0)
+            if msg and msg.get("type") == "register_ack":
+                log.info("Received assignment", msg=msg)
+                break
+            elif msg and msg.get("type") == "topology":
+                await self._handle_topology(msg)
+                break
+
+        log.info("Assignment received")
+
+    async def _handle_topology(self, msg: Dict[str, Any]):
+        """Handle topology assignment from coordinator."""
+        # Find our assignment
+        for node_info in msg.get("nodes", []):
+            if node_info["node_id"] == self.config.node_id:
+                self.layer_start = node_info["layer_start"]
+                self.layer_end = node_info["layer_end"]
+                self.position = PipelinePosition[node_info["position"]]
+
+                # Setup pipeline sockets
+                upstream = node_info.get("upstream")
+                downstream_port = node_info.get("downstream_port")
+
+                if upstream or downstream_port:
+                    self.zmq_handler.setup_pipeline(upstream, f"tcp://*:{downstream_port}" if downstream_port else None)
+
+                log.info(
+                    "Topology configured",
+                    layers=f"{self.layer_start}-{self.layer_end}",
+                    position=self.position.name,
+                    upstream=upstream,
+                    downstream=downstream_port,
+                )
+                break
+
+    async def load_model(self, model_path: str):
+        """Load the assigned portion of the model."""
+        if self.layer_start is None or self.layer_end is None:
+            raise RuntimeError("No layer assignment yet")
+
+        log.info(
+            "Loading model",
+            path=model_path,
+            layers=f"{self.layer_start}-{self.layer_end}",
+        )
+
+        loader = PartialModelLoader(model_path, self.device, self.dtype)
+
+        self.model, self.tokenizer = loader.load_partial_model(
+            layer_start=self.layer_start,
+            layer_end=self.layer_end,
+            include_embedding=(self.position == PipelinePosition.FIRST),
+            include_lm_head=(self.position == PipelinePosition.LAST),
+        )
+
+        log.info("Model loaded", layers=len(self.model.layers))
+
+        # Setup pipeline node
+        pipeline_config = PipelineConfig(
+            node_id=self.config.node_id,
+            position=self.position,
+            upstream_addr=None,  # Set via zmq_handler
+            downstream_port=self.config.pipeline_port if self.position != PipelinePosition.LAST else None,
+        )
+
+        self.pipeline_node = PipelineNode(
+            config=pipeline_config,
+            model=self.model,
+            device=self.device,
+        )
+
+        # Notify coordinator
+        await self.zmq_handler.send({
+            "type": "model_loaded",
+            "node_id": self.config.node_id,
+            "layers": list(range(self.layer_start, self.layer_end)),
+        })
+
+    async def _event_loop(self):
+        """Main event loop."""
+        log.info("Entering event loop")
+
+        while self.running:
+            try:
+                msg = await self.zmq_handler.receive(timeout=0.1)
+                if msg:
+                    await self._handle_message(msg)
+
+                # Check broadcasts
+                broadcast = await self.zmq_handler.check_broadcast()
+                if broadcast:
+                    await self._handle_broadcast(broadcast)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error("Event loop error", error=str(e))
+
+    async def _handle_message(self, msg: Dict[str, Any]):
+        """Handle incoming message."""
+        msg_type = msg.get("type")
+
+        if msg_type == "load_model":
+            await self.load_model(msg["model_path"])
+
+        elif msg_type == "topology":
+            await self._handle_topology(msg)
+
+        elif msg_type == "forward":
+            await self._handle_forward(msg)
+
+        elif msg_type == "generate":
+            await self._handle_generate(msg)
+
+        elif msg_type == "health_check":
+            await self._handle_health_check()
+
+        elif msg_type == "shutdown":
+            self.running = False
+
+    async def _handle_broadcast(self, msg: Dict[str, Any]):
+        """Handle broadcast message."""
+        msg_type = msg.get("type")
+
+        if msg_type == "topology_change":
+            await self._handle_topology(msg)
+
+    async def _handle_forward(self, msg: Dict[str, Any]):
+        """Handle forward pass request."""
+        if not self.model:
+            log.warning("Forward request but no model loaded")
+            return
+
+        sequence_id = msg.get("sequence_id", "")
+        past_len = msg.get("past_len", 0)
+
+        # First node processes token IDs, others process hidden states
+        if self.position == PipelinePosition.FIRST:
+            token_ids = msg.get("token_ids", [])
+            if not token_ids:
+                log.warning("No token_ids in forward request")
+                return
+            input_ids = torch.tensor([token_ids], device=self.device)
+            hidden_states = input_ids
+        else:
+            # Receive hidden states from upstream
+            result = await self.zmq_handler.receive_hidden_states(self.device, timeout=30.0)
+            if result is None:
+                log.warning("Timeout waiting for hidden states")
+                return
+            hidden_states, seq_id, _ = result
+            sequence_id = seq_id
+
+        # Get position IDs
+        seq_len = hidden_states.shape[1]
+        position_ids = torch.arange(past_len, past_len + seq_len, device=self.device).unsqueeze(0)
+
+        # Forward pass
+        with torch.no_grad():
+            output, new_kv = self.model(
+                hidden_states,
+                position_ids=position_ids,
+                use_cache=True,
+            )
+
+        # Send result
+        if self.position == PipelinePosition.LAST:
+            # Sample token and send result to coordinator
+            logits = output[0, -1, :].float()  # Get last position logits
+
+            # Simple argmax for now (sampling is done in coordinator)
+            token_id = int(torch.argmax(logits).item())
+
+            # Decode token if tokenizer available
+            token_text = ""
+            if self.tokenizer:
+                token_text = self.tokenizer.decode([token_id])
+
+            await self.zmq_handler.send({
+                "type": "forward_result",
+                "node_id": self.config.node_id,
+                "sequence_id": sequence_id,
+                "logits": logits.tolist(),
+                "token_id": token_id,
+                "text": token_text,
+                "finished": token_id == self.tokenizer.eos_token_id if self.tokenizer else False,
+                "finish_reason": "stop" if (self.tokenizer and token_id == self.tokenizer.eos_token_id) else None,
+            })
+        else:
+            # Forward hidden states to next node
+            await self.zmq_handler.send_hidden_states(
+                output,
+                sequence_id=sequence_id,
+                position=past_len + seq_len,
+            )
+
+    async def _handle_generate(self, msg: Dict[str, Any]):
+        """Handle generation request (first node only)."""
+        if self.position != PipelinePosition.FIRST:
+            log.warning("Generate request on non-first node")
+            return
+
+        if not self.model or not self.tokenizer:
+            log.warning("Generate request but no model loaded")
+            return
+
+        prompt = msg.get("prompt", "")
+        max_tokens = msg.get("max_tokens", 100)
+
+        # Tokenize
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        input_ids = inputs["input_ids"].to(self.device)
+
+        # Inject into pipeline
+        if self.pipeline_node:
+            batch_id = await self.pipeline_node.inject_batch(
+                input_ids,
+                sequence_ids=[msg.get("sequence_id", "default")],
+            )
+
+            log.info("Injected batch", batch_id=batch_id)
+
+    async def _handle_health_check(self):
+        """Handle health check."""
+        device_info = self.memory_tracker.get_device_info()
+
+        await self.zmq_handler.send({
+            "type": "heartbeat",
+            "node_id": self.config.node_id,
+            "mem_used": device_info.total_memory - device_info.free_memory,
+            "mem_total": device_info.total_memory,
+        })
+
+    def stop(self):
+        """Stop the worker."""
+        self.running = False
+
+        if self.pipeline_node:
+            self.pipeline_node.stop()
+
+        if self.zmq_handler:
+            self.zmq_handler.close()
+
+        log.info("Worker stopped")
+
+
+async def main():
+    """Example usage."""
+    import sys
+
+    config = DistributedWorkerConfig(
+        node_id=sys.argv[1] if len(sys.argv) > 1 else "worker-1",
+        coordinator_addr="tcp://localhost:5555",
+    )
+
+    worker = DistributedWorker(config)
+
+    try:
+        await worker.start()
+    except KeyboardInterrupt:
+        worker.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
