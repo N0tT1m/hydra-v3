@@ -12,6 +12,9 @@ CONFIG_FILE="config.toml"
 WITH_LOCAL_WORKER=false
 WORKER_NODE_ID="local-worker"
 WORKER_DEVICE="auto"
+LOAD_MODEL=""
+MODEL_ID=""
+MODEL_LAYERS=32
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -32,6 +35,18 @@ while [[ $# -gt 0 ]]; do
             WORKER_DEVICE="$2"
             shift 2
             ;;
+        --load-model)
+            LOAD_MODEL="$2"
+            shift 2
+            ;;
+        --model-id)
+            MODEL_ID="$2"
+            shift 2
+            ;;
+        --model-layers)
+            MODEL_LAYERS="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             echo "Usage: $0 [OPTIONS]"
@@ -39,6 +54,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --with-local-worker     Start a local Python worker"
             echo "  --worker-node-id ID     Node ID for local worker (default: local-worker)"
             echo "  --worker-device DEV     Device for local worker (default: auto)"
+            echo "  --load-model MODEL      HuggingFace model to auto-load"
+            echo "  --model-id ID           ID for the loaded model"
+            echo "  --model-layers N        Number of layers (default: 32)"
             exit 1
             ;;
     esac
@@ -66,6 +84,9 @@ echo "  ZMQ Broadcast: tcp://*:5557"
 if [ "$WITH_LOCAL_WORKER" = true ]; then
     echo "  Local Worker: $WORKER_NODE_ID ($WORKER_DEVICE)"
 fi
+if [ -n "$LOAD_MODEL" ]; then
+    echo "  Auto-load Model: $LOAD_MODEL ($MODEL_LAYERS layers)"
+fi
 echo ""
 echo "Press Ctrl+C to stop"
 echo ""
@@ -79,6 +100,13 @@ if [ "$WITH_LOCAL_WORKER" = true ]; then
     ARGS+=("-with-local-worker")
     ARGS+=("-worker-node-id" "$WORKER_NODE_ID")
     ARGS+=("-worker-device" "$WORKER_DEVICE")
+fi
+if [ -n "$LOAD_MODEL" ]; then
+    ARGS+=("-load-model" "$LOAD_MODEL")
+    if [ -n "$MODEL_ID" ]; then
+        ARGS+=("-model-id" "$MODEL_ID")
+    fi
+    ARGS+=("-model-layers" "$MODEL_LAYERS")
 fi
 
 exec ./build/bin/hydra "${ARGS[@]}"

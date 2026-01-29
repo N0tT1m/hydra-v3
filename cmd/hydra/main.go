@@ -8,7 +8,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/hydra-v3/internal/api"
 	"github.com/hydra-v3/internal/config"
@@ -24,6 +26,9 @@ func main() {
 	withLocalWorker := flag.Bool("with-local-worker", false, "Start a local Python worker")
 	workerNodeID := flag.String("worker-node-id", "local-worker", "Node ID for local worker")
 	workerDevice := flag.String("worker-device", "auto", "Device for local worker (auto, cuda:0, mps, cpu)")
+	loadModel := flag.String("load-model", "", "HuggingFace model to load on startup (e.g., meta-llama/Llama-2-7b-hf)")
+	modelID := flag.String("model-id", "", "ID to assign to the loaded model (default: derived from model path)")
+	modelLayers := flag.Int("model-layers", 32, "Number of layers in the model")
 	flag.Parse()
 
 	// Setup logging
@@ -90,6 +95,34 @@ func main() {
 
 	if startWorker {
 		workerCmd = startLocalWorker(workerNode, workerDev, cfg.ZMQ.RouterAddr)
+	}
+
+	// Auto-load model if specified
+	if *loadModel != "" {
+		go func() {
+			// Wait for workers to register
+			time.Sleep(3 * time.Second)
+
+			mID := *modelID
+			if mID == "" {
+				// Derive model ID from path (e.g., "meta-llama/Llama-2-7b-hf" -> "llama-2-7b-hf")
+				parts := strings.Split(*loadModel, "/")
+				mID = strings.ToLower(parts[len(parts)-1])
+			}
+
+			log.Info().
+				Str("model_path", *loadModel).
+				Str("model_id", mID).
+				Int("layers", *modelLayers).
+				Msg("Auto-loading model")
+
+			err := coord.GetModelManager().LoadModel(*loadModel, mID, *modelLayers)
+			if err != nil {
+				log.Error().Err(err).Msg("Failed to auto-load model")
+			} else {
+				log.Info().Str("model_id", mID).Msg("Model loaded successfully")
+			}
+		}()
 	}
 
 	// Wait for shutdown signal

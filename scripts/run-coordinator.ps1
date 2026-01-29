@@ -4,7 +4,10 @@ param(
     [string]$ConfigFile = "config.toml",
     [switch]$WithLocalWorker,
     [string]$WorkerNodeId = "local-worker",
-    [string]$WorkerDevice = "auto"
+    [string]$WorkerDevice = "auto",
+    [string]$LoadModel = "",
+    [string]$ModelId = "",
+    [int]$ModelLayers = 32
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +72,9 @@ Write-Host "  ZMQ Broadcast: tcp://*:5557" -ForegroundColor Cyan
 if ($WithLocalWorker) {
     Write-Host "  Local Worker: $WorkerNodeId ($WorkerDevice)" -ForegroundColor Cyan
 }
+if ($LoadModel) {
+    Write-Host "  Auto-load Model: $LoadModel ($ModelLayers layers)" -ForegroundColor Cyan
+}
 Write-Host ""
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 Write-Host ""
@@ -82,6 +88,13 @@ if ($WithLocalWorker) {
     $args += "-with-local-worker"
     $args += "-worker-node-id", $WorkerNodeId
     $args += "-worker-device", $WorkerDevice
+}
+if ($LoadModel) {
+    $args += "-load-model", $LoadModel
+    if ($ModelId) {
+        $args += "-model-id", $ModelId
+    }
+    $args += "-model-layers", $ModelLayers
 }
 
 if ($args.Count -gt 0) {
