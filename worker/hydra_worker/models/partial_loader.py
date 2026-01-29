@@ -14,6 +14,14 @@ import structlog
 
 log = structlog.get_logger()
 
+# Try to import bitsandbytes for proper int8/int4 quantization
+try:
+    import bitsandbytes as bnb
+    HAS_BITSANDBYTES = True
+except ImportError:
+    HAS_BITSANDBYTES = False
+    log.warning("bitsandbytes not available - quantization will use fallback method")
+
 
 class PartialTransformer(nn.Module):
     """A transformer that only contains a subset of layers."""
@@ -259,12 +267,22 @@ class PartialModelLoader:
         Uses selective loading - only loads weights for the assigned layers,
         not the full model. This enables distributed loading across multiple GPUs.
         """
+        # Log quantization status
+        quant_info = ""
+        if self.quantize:
+            if HAS_BITSANDBYTES:
+                quant_info = f" with {self.quant_bits}-bit quantization (bitsandbytes)"
+            else:
+                quant_info = f" (quantization unavailable - bitsandbytes not installed)"
+
         log.info(
             "Loading partial model (selective)",
             layers=f"{layer_start}-{layer_end}",
             embedding=include_embedding,
             lm_head=include_lm_head,
             dtype=self.dtype_str,
+            quantization=f"{self.quant_bits}-bit" if self.quantize else "none",
+            bitsandbytes=HAS_BITSANDBYTES,
         )
 
         # Import the correct model class
@@ -299,7 +317,18 @@ class PartialModelLoader:
         for layer_idx in range(layer_start, layer_end):
             layer = self._create_and_load_layer(layer_idx, model_class)
             partial.layers.append(layer)
-            log.info(f"Loaded layer {layer_idx}")
+
+            # Log memory usage
+            if torch.cuda.is_available():
+                mem_used = torch.cuda.memory_allocated() / (1024**3)
+                mem_reserved = torch.cuda.memory_reserved() / (1024**3)
+                log.info(
+                    f"Loaded layer {layer_idx}",
+                    mem_used_gb=f"{mem_used:.2f}",
+                    mem_reserved_gb=f"{mem_reserved:.2f}",
+                )
+            else:
+                log.info(f"Loaded layer {layer_idx}")
 
             # Clear CUDA cache periodically
             if torch.cuda.is_available() and (layer_idx - layer_start) % 4 == 0:
@@ -363,19 +392,16 @@ class PartialModelLoader:
         """Create a layer and load its weights."""
         model_type = getattr(self.config, "model_type", "").lower()
 
-        # Get all weights for this layer
+        # Get all weights for this layer (load in float16/bfloat16 first)
         weight_names = self._get_layer_weight_names(layer_idx)
         weights = {}
         for name in weight_names:
             short_name = name.replace(f"{self._get_layer_prefix()}{layer_idx}.", "")
             tensor = self._load_tensor(name)
             if tensor is not None:
-                # Apply quantization if requested
-                if self.quantize and tensor.numel() > 1024:  # Only quantize larger tensors
-                    tensor = self._quantize_tensor(tensor)
                 weights[short_name] = tensor
 
-        # Create the appropriate layer based on model type
+        # Create the appropriate layer based on model type (on CPU)
         if "qwen" in model_type:
             layer = self._create_qwen_layer(layer_idx, weights)
         elif "llama" in model_type:
@@ -386,58 +412,152 @@ class PartialModelLoader:
             # Generic fallback - try to auto-detect from weight names
             layer = self._create_generic_layer(layer_idx, weights)
 
+        # Apply quantization (replaces linear layers with bitsandbytes versions)
+        if self.quantize:
+            layer = self._quantize_layer(layer)
+            log.debug(f"Layer {layer_idx} quantized to {self.quant_bits}-bit")
+
+        # Move to GPU (bitsandbytes will finish quantization on CUDA move)
         return layer.to(self.device)
 
-    def _quantize_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Quantize a tensor to int8 or int4."""
-        if self.quant_bits == 8:
-            # Simple int8 quantization
-            scale = tensor.abs().max() / 127.0
-            if scale == 0:
-                return tensor.to(self.dtype)
-            quantized = (tensor / scale).round().clamp(-127, 127).to(torch.int8)
-            # Store as float for now (proper int8 inference needs special kernels)
-            return (quantized.float() * scale).to(self.dtype)
-        elif self.quant_bits == 4:
-            # Simple int4-like quantization (stored as int8)
-            scale = tensor.abs().max() / 7.0
-            if scale == 0:
-                return tensor.to(self.dtype)
-            quantized = (tensor / scale).round().clamp(-7, 7).to(torch.int8)
-            return (quantized.float() * scale).to(self.dtype)
-        else:
-            return tensor.to(self.dtype)
+    def _quantize_layer(self, layer: nn.Module) -> nn.Module:
+        """Replace linear layers with quantized versions using bitsandbytes."""
+        if not self.quantize:
+            return layer
+
+        if not HAS_BITSANDBYTES:
+            log.warning("Quantization requested but bitsandbytes not available")
+            return layer
+
+        replaced = 0
+        failed = 0
+
+        def _replace_linears(module: nn.Module, prefix: str = ""):
+            nonlocal replaced, failed
+            for name, child in list(module.named_children()):
+                full_name = f"{prefix}.{name}" if prefix else name
+                if isinstance(child, nn.Linear):
+                    # Replace with bitsandbytes quantized linear
+                    if self.quant_bits == 8:
+                        quantized_linear = self._create_int8_linear(child)
+                    elif self.quant_bits == 4:
+                        quantized_linear = self._create_int4_linear(child)
+                    else:
+                        continue
+
+                    if quantized_linear is not None:
+                        setattr(module, name, quantized_linear)
+                        replaced += 1
+                    else:
+                        failed += 1
+                else:
+                    # Recursively quantize nested modules (e.g., MoE experts)
+                    _replace_linears(child, full_name)
+
+        _replace_linears(layer)
+
+        if replaced > 0 or failed > 0:
+            log.debug(
+                f"Quantization: replaced {replaced} linear layers, {failed} failed"
+            )
+
+        return layer
+
+    def _create_int8_linear(self, linear: nn.Linear) -> Optional[nn.Module]:
+        """Create an int8 quantized linear layer from a regular linear layer."""
+        try:
+            has_bias = linear.bias is not None
+
+            # Create Int8 linear layer
+            int8_linear = bnb.nn.Linear8bitLt(
+                linear.in_features,
+                linear.out_features,
+                bias=has_bias,
+                has_fp16_weights=False,
+                threshold=6.0,  # Outlier threshold for mixed-precision
+            )
+
+            # Copy weights (bitsandbytes will quantize them on first forward pass or when moved to GPU)
+            int8_linear.weight = bnb.nn.Int8Params(
+                linear.weight.data.clone(),
+                requires_grad=False,
+                has_fp16_weights=False,
+            )
+
+            if has_bias:
+                int8_linear.bias = nn.Parameter(linear.bias.data.clone())
+
+            return int8_linear
+        except Exception as e:
+            log.warning(f"Failed to create int8 linear: {e}")
+            return None
+
+    def _create_int4_linear(self, linear: nn.Linear) -> Optional[nn.Module]:
+        """Create a 4-bit quantized linear layer from a regular linear layer."""
+        try:
+            has_bias = linear.bias is not None
+
+            # Use bitsandbytes 4-bit quantization (NF4)
+            int4_linear = bnb.nn.Linear4bit(
+                linear.in_features,
+                linear.out_features,
+                bias=has_bias,
+                compute_dtype=self.dtype,
+                compress_statistics=True,
+                quant_type="nf4",  # Normal Float 4-bit
+            )
+
+            # Copy weights
+            int4_linear.weight = bnb.nn.Params4bit(
+                linear.weight.data.clone(),
+                requires_grad=False,
+                compress_statistics=True,
+                quant_type="nf4",
+            )
+
+            if has_bias:
+                int4_linear.bias = nn.Parameter(linear.bias.data.clone())
+
+            return int4_linear
+        except Exception as e:
+            log.warning(f"Failed to create int4 linear: {e}")
+            return None
 
     def _create_qwen_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a Qwen/Qwen2 layer."""
+        """Create a Qwen/Qwen2 layer on CPU, load weights, then move to GPU."""
         model_type = getattr(self.config, "model_type", "").lower()
 
         # Ensure config has required attributes with defaults
         self._patch_config_defaults()
 
-        if self.is_moe or "moe" in model_type or "qwen3" in model_type:
-            # Qwen2 MoE / Qwen3 MoE
-            try:
-                from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
-                layer = Qwen3MoeDecoderLayer(self.config, layer_idx)
-            except (ImportError, AttributeError) as e:
-                log.debug(f"Qwen3MoeDecoderLayer failed: {e}, trying Qwen2Moe")
+        # Create layer on CPU to avoid double GPU memory allocation
+        with torch.device('cpu'):
+            if self.is_moe or "moe" in model_type or "qwen3" in model_type:
+                # Qwen2 MoE / Qwen3 MoE
                 try:
-                    from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
-                    layer = Qwen2MoeDecoderLayer(self.config, layer_idx)
+                    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
+                    layer = Qwen3MoeDecoderLayer(self.config, layer_idx)
                 except (ImportError, AttributeError) as e:
-                    log.warning(f"Qwen MoE layer not available ({e}), using generic")
-                    return self._create_generic_layer(layer_idx, weights)
-        else:
-            # Dense Qwen2
-            try:
-                from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-                layer = Qwen2DecoderLayer(self.config, layer_idx)
-            except (ImportError, AttributeError):
-                from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-                layer = LlamaDecoderLayer(self.config, layer_idx)
+                    log.debug(f"Qwen3MoeDecoderLayer failed: {e}, trying Qwen2Moe")
+                    try:
+                        from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
+                        layer = Qwen2MoeDecoderLayer(self.config, layer_idx)
+                    except (ImportError, AttributeError) as e:
+                        log.warning(f"Qwen MoE layer not available ({e}), using generic")
+                        return self._create_generic_layer(layer_idx, weights)
+            else:
+                # Dense Qwen2
+                try:
+                    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+                    layer = Qwen2DecoderLayer(self.config, layer_idx)
+                except (ImportError, AttributeError):
+                    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                    layer = LlamaDecoderLayer(self.config, layer_idx)
 
+        # Load weights on CPU
         self._load_weights_into_layer(layer, weights)
+
+        # Now move to GPU (single transfer, no double allocation)
         return layer
 
     def _patch_config_defaults(self):
@@ -457,33 +577,35 @@ class PartialModelLoader:
                 setattr(self.config, attr, default)
 
     def _create_llama_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a Llama layer."""
+        """Create a Llama layer on CPU, load weights, then ready for GPU transfer."""
         from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-        layer = LlamaDecoderLayer(self.config, layer_idx)
+        with torch.device('cpu'):
+            layer = LlamaDecoderLayer(self.config, layer_idx)
         self._load_weights_into_layer(layer, weights)
         return layer
 
     def _create_mistral_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a Mistral/Mixtral layer."""
-        if self.is_moe:
-            try:
-                from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
-                layer = MixtralDecoderLayer(self.config, layer_idx)
-            except ImportError:
-                return self._create_generic_layer(layer_idx, weights)
-        else:
-            try:
-                from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
-                layer = MistralDecoderLayer(self.config, layer_idx)
-            except ImportError:
-                from transformers.models.llama.modeling_llama import LlamaDecoderLayer
-                layer = LlamaDecoderLayer(self.config, layer_idx)
+        """Create a Mistral/Mixtral layer on CPU."""
+        with torch.device('cpu'):
+            if self.is_moe:
+                try:
+                    from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
+                    layer = MixtralDecoderLayer(self.config, layer_idx)
+                except ImportError:
+                    return self._create_generic_layer(layer_idx, weights)
+            else:
+                try:
+                    from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+                    layer = MistralDecoderLayer(self.config, layer_idx)
+                except ImportError:
+                    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                    layer = LlamaDecoderLayer(self.config, layer_idx)
 
         self._load_weights_into_layer(layer, weights)
         return layer
 
     def _create_generic_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
-        """Create a generic layer using Llama as fallback."""
+        """Create a generic layer using Llama as fallback, on CPU."""
         from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaConfig
 
         # Create a LlamaConfig from the model config
@@ -497,7 +619,8 @@ class PartialModelLoader:
             max_position_embeddings=getattr(self.config, "max_position_embeddings", 4096),
         )
 
-        layer = LlamaDecoderLayer(llama_config, layer_idx)
+        with torch.device('cpu'):
+            layer = LlamaDecoderLayer(llama_config, layer_idx)
         self._load_weights_into_layer(layer, weights)
         return layer
 
@@ -526,7 +649,16 @@ class PartialModelLoader:
 
     def estimate_memory(self, layer_start: int, layer_end: int) -> int:
         """Estimate GPU memory needed for layers in bytes."""
-        bytes_per_param = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
+        # Base bytes per param based on dtype
+        if self.quantize:
+            if self.quant_bits == 4:
+                bytes_per_param = 0.5  # 4-bit = 0.5 bytes per param
+            elif self.quant_bits == 8:
+                bytes_per_param = 1.0  # 8-bit = 1 byte per param
+            else:
+                bytes_per_param = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
+        else:
+            bytes_per_param = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
 
         hidden = self.config.hidden_size
         intermediate = getattr(self.config, "intermediate_size", hidden * 4)
