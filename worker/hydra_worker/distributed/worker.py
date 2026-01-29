@@ -152,8 +152,8 @@ class DistributedWorker:
                 )
                 break
 
-    async def load_model(self, model_path: str):
-        """Load the assigned portion of the model."""
+    def _load_model_sync(self, model_path: str):
+        """Synchronous model loading (runs in thread to not block heartbeats)."""
         if self.layer_start is None or self.layer_end is None:
             raise RuntimeError("No layer assignment yet")
 
@@ -188,7 +188,14 @@ class DistributedWorker:
             device=self.device,
         )
 
-        # Notify coordinator
+    async def load_model(self, model_path: str):
+        """Load model asynchronously (in thread pool to not block heartbeats)."""
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            await loop.run_in_executor(pool, self._load_model_sync, model_path)
+
+        # Notify coordinator (must be done in async context)
         await self.zmq_handler.send({
             "type": "model_loaded",
             "node_id": self.config.node_id,
