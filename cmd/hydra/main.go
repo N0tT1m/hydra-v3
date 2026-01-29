@@ -128,7 +128,7 @@ func main() {
 				Int("workers", coord.GetRegistry().HealthyNodeCount()).
 				Msg("Auto-loading model")
 
-			err := coord.GetModelManager().LoadModel(ctx, *loadModel, mID, *modelLayers)
+			err := coord.GetModelManager().LoadModel(ctx, mID, *loadModel, *modelLayers)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to auto-load model")
 			} else {
