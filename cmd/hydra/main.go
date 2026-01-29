@@ -100,9 +100,6 @@ func main() {
 	// Auto-load model if specified
 	if *loadModel != "" {
 		go func() {
-			// Wait for workers to register
-			time.Sleep(3 * time.Second)
-
 			mID := *modelID
 			if mID == "" {
 				// Derive model ID from path (e.g., "meta-llama/Llama-2-7b-hf" -> "llama-2-7b-hf")
@@ -110,10 +107,25 @@ func main() {
 				mID = strings.ToLower(parts[len(parts)-1])
 			}
 
+			// Wait for at least one healthy worker with retries
+			log.Info().Msg("Waiting for healthy workers before loading model...")
+			for i := 0; i < 30; i++ { // Try for up to 30 seconds
+				time.Sleep(1 * time.Second)
+				if coord.GetRegistry().HealthyNodeCount() > 0 {
+					break
+				}
+			}
+
+			if coord.GetRegistry().HealthyNodeCount() == 0 {
+				log.Error().Msg("No healthy workers available after 30s, skipping model load")
+				return
+			}
+
 			log.Info().
 				Str("model_path", *loadModel).
 				Str("model_id", mID).
 				Int("layers", *modelLayers).
+				Int("workers", coord.GetRegistry().HealthyNodeCount()).
 				Msg("Auto-loading model")
 
 			err := coord.GetModelManager().LoadModel(ctx, *loadModel, mID, *modelLayers)
