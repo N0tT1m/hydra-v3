@@ -1,10 +1,15 @@
 """CLI entry point for hydra worker."""
 
 import asyncio
+import platform
 import click
 import structlog
 import signal
 import sys
+
+# Fix Windows asyncio + ZMQ compatibility
+if platform.system() == "Windows":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from hydra_worker.distributed.worker import DistributedWorker, DistributedWorkerConfig
 
