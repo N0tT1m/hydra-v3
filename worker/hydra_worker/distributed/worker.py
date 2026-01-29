@@ -383,14 +383,17 @@ class DistributedWorker:
 
     async def _handle_health_check(self):
         """Handle health check."""
-        device_info = self.memory_tracker.get_device_info()
+        try:
+            device_info = self.memory_tracker.get_device_info()
 
-        await self.zmq_handler.send({
-            "type": "heartbeat",
-            "node_id": self.config.node_id,
-            "mem_used": device_info.total_memory - device_info.free_memory,
-            "mem_total": device_info.total_memory,
-        })
+            await self.zmq_handler.send({
+                "type": "heartbeat",
+                "node_id": self.config.node_id,
+                "mem_used": device_info.total_memory - device_info.free_memory,
+                "mem_total": device_info.total_memory,
+            })
+        except Exception as e:
+            log.error("Failed to send heartbeat", error=str(e))
 
     def stop(self):
         """Stop the worker."""
