@@ -3,6 +3,9 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
 import torch
+import structlog
+
+log = structlog.get_logger()
 
 
 @dataclass
@@ -26,28 +29,63 @@ def detect_device(device_str: str = "auto") -> DeviceInfo:
     Returns:
         DeviceInfo with device details
     """
+    log.info("Detecting device", requested=device_str)
+
     if device_str == "auto":
+        log.info(
+            "Auto-detection",
+            cuda_available=torch.cuda.is_available(),
+            cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            mps_available=torch.backends.mps.is_available(),
+        )
         if torch.cuda.is_available():
-            return _get_cuda_info(0)
+            info = _get_cuda_info(0)
+            log.info(
+                "Selected CUDA device",
+                name=info.name,
+                vram_gb=round(info.total_memory / (1024**3), 2),
+                compute_capability=info.compute_capability,
+            )
+            return info
         elif torch.backends.mps.is_available():
-            return _get_mps_info()
+            info = _get_mps_info()
+            log.info("Selected MPS device", name=info.name)
+            return info
         else:
-            return _get_cpu_info()
+            info = _get_cpu_info()
+            log.warning("No GPU detected, falling back to CPU")
+            return info
 
     if device_str.startswith("cuda"):
         parts = device_str.split(":")
         idx = int(parts[1]) if len(parts) > 1 else 0
-        return _get_cuda_info(idx)
+        info = _get_cuda_info(idx)
+        log.info(
+            "Using CUDA device",
+            index=idx,
+            name=info.name,
+            vram_gb=round(info.total_memory / (1024**3), 2),
+        )
+        return info
     elif device_str == "mps":
-        return _get_mps_info()
+        info = _get_mps_info()
+        log.info("Using MPS device", name=info.name)
+        return info
     else:
-        return _get_cpu_info()
+        info = _get_cpu_info()
+        log.info("Using CPU device")
+        return info
 
 
 def _get_cuda_info(idx: int) -> DeviceInfo:
     """Get CUDA device information."""
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA not available")
+        log.error(
+            "CUDA requested but not available",
+            cuda_built=torch.backends.cuda.is_built(),
+            cudnn_available=torch.backends.cudnn.is_available() if torch.backends.cuda.is_built() else False,
+        )
+        raise RuntimeError("CUDA not available - check PyTorch installation and NVIDIA drivers")
 
     props = torch.cuda.get_device_properties(idx)
     total = props.total_memory

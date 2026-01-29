@@ -137,23 +137,48 @@ if (-not (Test-Path "venv")) {
 # Upgrade pip
 & python -m pip install --upgrade pip --quiet
 
-# Install worker package
+# Check for NVIDIA GPU and install appropriate PyTorch
+Write-Host ""
+Write-Host "Detecting GPU and installing PyTorch..." -ForegroundColor Green
+
+$hasNvidiaGpu = $false
+try {
+    $gpuInfo = Get-WmiObject Win32_VideoController | Where-Object { $_.Name -like "*NVIDIA*" }
+    if ($gpuInfo) {
+        $hasNvidiaGpu = $true
+        Write-Host "  Found NVIDIA GPU: $($gpuInfo.Name)" -ForegroundColor Cyan
+    }
+} catch {
+    Write-Host "  Could not detect GPU via WMI" -ForegroundColor Yellow
+}
+
+if ($hasNvidiaGpu) {
+    Write-Host "  Installing PyTorch with CUDA 12.1 support..." -ForegroundColor Green
+    & pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --quiet
+} else {
+    Write-Host "  No NVIDIA GPU detected, installing CPU-only PyTorch..." -ForegroundColor Yellow
+    & pip install torch torchvision torchaudio --quiet
+}
+
+# Install worker package (other dependencies)
 Write-Host "Installing Python worker dependencies..." -ForegroundColor Green
 & pip install -e . --quiet
 
-# Check for CUDA
+# Verify CUDA
 Write-Host ""
-Write-Host "Checking GPU support..." -ForegroundColor Green
+Write-Host "Verifying GPU support..." -ForegroundColor Green
 try {
     $cudaCheck = & python -c "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')" 2>&1
     if ($cudaCheck -eq "CUDA") {
         Write-Host "  CUDA is available" -ForegroundColor Green
         $gpuName = & python -c "import torch; print(torch.cuda.get_device_name(0))" 2>&1
         Write-Host "  GPU: $gpuName" -ForegroundColor Cyan
+        $vram = & python -c "import torch; print(f'{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')" 2>&1
+        Write-Host "  VRAM: $vram" -ForegroundColor Cyan
     } else {
-        Write-Host "  CUDA not detected. Using CPU." -ForegroundColor Yellow
-        Write-Host "  For GPU support, install PyTorch with CUDA:" -ForegroundColor Yellow
-        Write-Host "    pip install torch --index-url https://download.pytorch.org/whl/cu118" -ForegroundColor White
+        Write-Host "  CUDA not available. Check NVIDIA drivers." -ForegroundColor Yellow
+        Write-Host "  To reinstall PyTorch with CUDA:" -ForegroundColor Yellow
+        Write-Host "    pip install torch --index-url https://download.pytorch.org/whl/cu121 --force-reinstall" -ForegroundColor White
     }
 } catch {
     Write-Host "  Could not detect GPU support" -ForegroundColor Yellow

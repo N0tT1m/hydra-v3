@@ -265,7 +265,7 @@ func (m *ModelManager) fetchModelLayers(modelPath string) (int, error) {
 		}
 		req.Header.Set("User-Agent", "hydra-coordinator/1.0")
 
-		log.Debug().Str("url", url).Msg("Fetching model config")
+		log.Info().Str("url", url).Msg("Fetching model config")
 
 		resp, err := client.Do(req)
 		if err != nil {

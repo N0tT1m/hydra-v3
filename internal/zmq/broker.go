@@ -185,7 +185,6 @@ func (b *Broker) handleRouterMessage() {
 	}
 
 	// Send to message channel
-	log.Debug().Str("type", string(msg.Type)).Str("node_id", msg.NodeID).Msg("Received message")
 	select {
 	case b.messageCh <- msg:
 	default:

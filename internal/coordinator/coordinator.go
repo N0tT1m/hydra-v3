@@ -159,7 +159,6 @@ func (c *Coordinator) handleHeartbeat(msg *zmq.Message) {
 		return
 	}
 
-	log.Debug().Str("node_id", hb.NodeID).Msg("Received heartbeat")
 	c.registry.UpdateHeartbeat(hb.NodeID, hb.MemoryUsed, hb.MemoryTotal, hb.GPUUtil)
 }
 
