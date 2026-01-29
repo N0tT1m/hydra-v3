@@ -20,6 +20,37 @@ if (-not $gitCmd) {
     exit 1
 }
 
+# Check for GCC (MinGW) - required for CGO
+$gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
+if (-not $gccCmd) {
+    Write-Host ""
+    Write-Host "GCC not found. Installing MinGW-w64..." -ForegroundColor Green
+
+    # Try chocolatey first
+    $choco = Get-Command choco -ErrorAction SilentlyContinue
+    if ($choco) {
+        & choco install mingw -y --no-progress
+
+        # Refresh PATH
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+    } else {
+        Write-Host "ERROR: Chocolatey not found. Install MinGW manually:" -ForegroundColor Red
+        Write-Host "  choco install mingw" -ForegroundColor White
+        Write-Host "  or download from https://winlibs.com/" -ForegroundColor White
+        exit 1
+    }
+
+    # Verify installation
+    $gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
+    if ($gccCmd) {
+        Write-Host "MinGW-w64 installed successfully" -ForegroundColor Green
+    } else {
+        Write-Host "WARNING: GCC still not in PATH. Restart PowerShell after installation." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "GCC found: $($gccCmd.Source)" -ForegroundColor Green
+}
+
 # Check for Visual Studio Build Tools or Visual Studio
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $hasVS = $false

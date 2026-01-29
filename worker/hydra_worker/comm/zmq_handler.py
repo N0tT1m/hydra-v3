@@ -23,6 +23,9 @@ class ZMQHandler:
         pipeline_port_base: int,
     ):
         self.worker_id = worker_id
+        # Normalize address - add tcp:// if not present
+        if not coordinator_address.startswith(("tcp://", "ipc://", "inproc://")):
+            coordinator_address = f"tcp://{coordinator_address}"
         self.coordinator_address = coordinator_address
         self.pipeline_port_base = pipeline_port_base
 

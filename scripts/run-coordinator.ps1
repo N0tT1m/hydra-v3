@@ -12,6 +12,15 @@ Set-Location $ProjectRoot
 $vcpkgRoot = "C:\vcpkg"
 $zmqLibDir = "$vcpkgRoot\installed\x64-windows\lib"
 
+# Check for GCC (required for CGO)
+$gccCmd = Get-Command gcc -ErrorAction SilentlyContinue
+if (-not $gccCmd) {
+    Write-Host "ERROR: GCC not found. Install MinGW-w64:" -ForegroundColor Red
+    Write-Host "  choco install mingw -y" -ForegroundColor White
+    Write-Host "Then restart PowerShell and try again." -ForegroundColor Yellow
+    exit 1
+}
+
 if (Test-Path $zmqLibDir) {
     $zmqLibFile = Get-ChildItem -Path $zmqLibDir -Filter "libzmq*.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($zmqLibFile) {
@@ -25,8 +34,9 @@ if (Test-Path $zmqLibDir) {
         Write-Host "ZeroMQ environment configured from vcpkg" -ForegroundColor Green
     }
 } else {
-    Write-Host "WARNING: vcpkg ZeroMQ not found at $zmqLibDir" -ForegroundColor Yellow
+    Write-Host "ERROR: vcpkg ZeroMQ not found at $zmqLibDir" -ForegroundColor Red
     Write-Host "Run .\scripts\install-zeromq-windows.ps1 first" -ForegroundColor Yellow
+    exit 1
 }
 
 # Check if coordinator is built
