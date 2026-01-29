@@ -386,29 +386,49 @@ class PartialModelLoader:
         """Create a Qwen/Qwen2 layer."""
         model_type = getattr(self.config, "model_type", "").lower()
 
+        # Ensure config has required attributes with defaults
+        self._patch_config_defaults()
+
         if self.is_moe or "moe" in model_type or "qwen3" in model_type:
             # Qwen2 MoE / Qwen3 MoE
             try:
-                from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
-                layer = Qwen2MoeDecoderLayer(self.config, layer_idx)
-            except ImportError:
+                from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
+                layer = Qwen3MoeDecoderLayer(self.config, layer_idx)
+            except (ImportError, AttributeError) as e:
+                log.debug(f"Qwen3MoeDecoderLayer failed: {e}, trying Qwen2Moe")
                 try:
-                    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
-                    layer = Qwen3MoeDecoderLayer(self.config, layer_idx)
-                except ImportError:
-                    log.warning("Qwen MoE layer not available, using generic")
+                    from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
+                    layer = Qwen2MoeDecoderLayer(self.config, layer_idx)
+                except (ImportError, AttributeError) as e:
+                    log.warning(f"Qwen MoE layer not available ({e}), using generic")
                     return self._create_generic_layer(layer_idx, weights)
         else:
             # Dense Qwen2
             try:
                 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
                 layer = Qwen2DecoderLayer(self.config, layer_idx)
-            except ImportError:
+            except (ImportError, AttributeError):
                 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
                 layer = LlamaDecoderLayer(self.config, layer_idx)
 
         self._load_weights_into_layer(layer, weights)
         return layer
+
+    def _patch_config_defaults(self):
+        """Add missing config attributes with sensible defaults."""
+        defaults = {
+            "qkv_bias": True,
+            "attention_bias": False,
+            "mlp_bias": False,
+            "attention_dropout": 0.0,
+            "rope_scaling": None,
+            "use_sliding_window": False,
+            "sliding_window": None,
+            "max_window_layers": 0,
+        }
+        for attr, default in defaults.items():
+            if not hasattr(self.config, attr):
+                setattr(self.config, attr, default)
 
     def _create_llama_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
         """Create a Llama layer."""
