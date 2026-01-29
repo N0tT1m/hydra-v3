@@ -7,7 +7,7 @@ param(
     [string]$WorkerDevice = "auto",
     [string]$LoadModel = "",
     [string]$ModelId = "",
-    [int]$ModelLayers = 32
+    [int]$ModelLayers = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -73,7 +73,11 @@ if ($WithLocalWorker) {
     Write-Host "  Local Worker: $WorkerNodeId ($WorkerDevice)" -ForegroundColor Cyan
 }
 if ($LoadModel) {
-    Write-Host "  Auto-load Model: $LoadModel ($ModelLayers layers)" -ForegroundColor Cyan
+    if ($ModelLayers -eq 0) {
+        Write-Host "  Auto-load Model: $LoadModel (auto-detect layers)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Auto-load Model: $LoadModel ($ModelLayers layers)" -ForegroundColor Cyan
+    }
 }
 Write-Host ""
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow

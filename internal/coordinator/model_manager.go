@@ -2,7 +2,9 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -45,9 +47,22 @@ func NewModelManager(cfg config.ClusterConfig, broker *zmq.Broker, registry *clu
 }
 
 // LoadModel loads a model distributed across workers
+// If totalLayers is 0, it will be auto-detected from the model config
 func (m *ModelManager) LoadModel(ctx context.Context, modelID, modelPath string, totalLayers int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Auto-detect layers if not specified
+	if totalLayers <= 0 {
+		detected, err := m.fetchModelLayers(modelPath)
+		if err != nil {
+			log.Warn().Err(err).Msg("Could not auto-detect layers, using default 32")
+			totalLayers = 32
+		} else {
+			totalLayers = detected
+			log.Info().Int("layers", totalLayers).Msg("Auto-detected model layers")
+		}
+	}
 
 	log.Info().
 		Str("model_id", modelID).
@@ -187,6 +202,46 @@ func (m *ModelManager) GetModelDistribution(modelID string) []LayerAssignment {
 		return info.Distribution
 	}
 	return nil
+}
+
+// fetchModelLayers fetches the model config from HuggingFace and returns the layer count
+func (m *ModelManager) fetchModelLayers(modelPath string) (int, error) {
+	// HuggingFace config.json URL
+	url := fmt.Sprintf("https://huggingface.co/%s/raw/main/config.json", modelPath)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch config: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("config not found: status %d", resp.StatusCode)
+	}
+
+	var config struct {
+		NumHiddenLayers int `json:"num_hidden_layers"`
+		NumLayers       int `json:"num_layers"`        // Some models use this
+		NLayer          int `json:"n_layer"`           // GPT-2 style
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return 0, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	// Try different field names
+	if config.NumHiddenLayers > 0 {
+		return config.NumHiddenLayers, nil
+	}
+	if config.NumLayers > 0 {
+		return config.NumLayers, nil
+	}
+	if config.NLayer > 0 {
+		return config.NLayer, nil
+	}
+
+	return 0, fmt.Errorf("could not find layer count in config")
 }
 
 // Message types

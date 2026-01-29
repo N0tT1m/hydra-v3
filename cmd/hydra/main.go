@@ -28,7 +28,7 @@ func main() {
 	workerDevice := flag.String("worker-device", "auto", "Device for local worker (auto, cuda:0, mps, cpu)")
 	loadModel := flag.String("load-model", "", "HuggingFace model to load on startup (e.g., meta-llama/Llama-2-7b-hf)")
 	modelID := flag.String("model-id", "", "ID to assign to the loaded model (default: derived from model path)")
-	modelLayers := flag.Int("model-layers", 32, "Number of layers in the model")
+	modelLayers := flag.Int("model-layers", 0, "Number of layers in the model (0 = auto-detect from HuggingFace)")
 	flag.Parse()
 
 	// Setup logging

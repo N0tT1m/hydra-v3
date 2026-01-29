@@ -14,7 +14,7 @@ WORKER_NODE_ID="local-worker"
 WORKER_DEVICE="auto"
 LOAD_MODEL=""
 MODEL_ID=""
-MODEL_LAYERS=32
+MODEL_LAYERS=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -85,7 +85,11 @@ if [ "$WITH_LOCAL_WORKER" = true ]; then
     echo "  Local Worker: $WORKER_NODE_ID ($WORKER_DEVICE)"
 fi
 if [ -n "$LOAD_MODEL" ]; then
-    echo "  Auto-load Model: $LOAD_MODEL ($MODEL_LAYERS layers)"
+    if [ "$MODEL_LAYERS" -eq 0 ]; then
+        echo "  Auto-load Model: $LOAD_MODEL (auto-detect layers)"
+    else
+        echo "  Auto-load Model: $LOAD_MODEL ($MODEL_LAYERS layers)"
+    fi
 fi
 echo ""
 echo "Press Ctrl+C to stop"
