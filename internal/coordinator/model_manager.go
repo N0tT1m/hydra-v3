@@ -110,14 +110,32 @@ func (m *ModelManager) LoadModel(ctx context.Context, modelID, modelPath string,
 	}
 
 	// Send load commands to each worker
-	for _, assign := range distribution {
-		loadCmd := LoadModelCommand{
-			ModelPath:     modelPath,
-			LayerStart:    assign.LayerStart,
-			LayerEnd:      assign.LayerEnd,
-			HasEmbedding:  assign.LayerStart == 0,
-			HasLMHead:     assign.LayerEnd == totalLayers,
+	for i, assign := range distribution {
+		// Determine position
+		position := "MIDDLE"
+		if i == 0 {
+			position = "FIRST"
 		}
+		if i == len(distribution)-1 {
+			position = "LAST"
+		}
+
+		loadCmd := LoadModelCommand{
+			ModelPath:    modelPath,
+			ModelID:      modelID,
+			LayerStart:   assign.LayerStart,
+			LayerEnd:     assign.LayerEnd,
+			TotalLayers:  totalLayers,
+			HasEmbedding: assign.LayerStart == 0,
+			HasLMHead:    assign.LayerEnd == totalLayers,
+		}
+
+		log.Info().
+			Str("node", assign.NodeID).
+			Str("position", position).
+			Int("layer_start", assign.LayerStart).
+			Int("layer_end", assign.LayerEnd).
+			Msg("Sending load command")
 
 		if err := m.broker.SendTo(assign.NodeID, zmq.MsgTypeLoadModel, loadCmd); err != nil {
 			log.Error().Err(err).Str("node", assign.NodeID).Msg("Failed to send load command")
@@ -207,60 +225,101 @@ func (m *ModelManager) GetModelDistribution(modelID string) []LayerAssignment {
 
 // fetchModelLayers fetches the model config from HuggingFace and returns the layer count
 func (m *ModelManager) fetchModelLayers(modelPath string) (int, error) {
-	// HuggingFace config.json URL (use resolve instead of raw for better compatibility)
-	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/config.json", modelPath)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create request: %w", err)
+	// Try multiple endpoints
+	urls := []string{
+		fmt.Sprintf("https://huggingface.co/%s/resolve/main/config.json", modelPath),
+		fmt.Sprintf("https://huggingface.co/%s/raw/main/config.json", modelPath),
 	}
 
-	// Add HF token from environment or config
-	if token := os.Getenv("HF_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+	// Get HF token
+	hfToken := os.Getenv("HF_TOKEN")
+	if hfToken == "" {
+		hfToken = os.Getenv("HUGGING_FACE_HUB_TOKEN")
+	}
+	if hfToken == "" {
+		hfToken = os.Getenv("HUGGINGFACE_TOKEN")
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to fetch config: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("config not found: status %d", resp.StatusCode)
-	}
-
-	var config struct {
-		NumHiddenLayers int `json:"num_hidden_layers"`
-		NumLayers       int `json:"num_layers"`        // Some models use this
-		NLayer          int `json:"n_layer"`           // GPT-2 style
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Follow redirects but add auth header
+			if hfToken != "" {
+				req.Header.Set("Authorization", "Bearer "+hfToken)
+			}
+			return nil
+		},
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		return 0, fmt.Errorf("failed to parse config: %w", err)
+	var lastErr error
+	for _, url := range urls {
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		// Add HF token if available
+		if hfToken != "" {
+			req.Header.Set("Authorization", "Bearer "+hfToken)
+		}
+		req.Header.Set("User-Agent", "hydra-coordinator/1.0")
+
+		log.Debug().Str("url", url).Msg("Fetching model config")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			defer resp.Body.Close()
+
+			var config struct {
+				NumHiddenLayers int `json:"num_hidden_layers"`
+				NumLayers       int `json:"num_layers"`
+				NLayer          int `json:"n_layer"`
+			}
+
+			if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+				resp.Body.Close()
+				lastErr = fmt.Errorf("failed to parse config: %w", err)
+				continue
+			}
+
+			// Try different field names
+			if config.NumHiddenLayers > 0 {
+				log.Info().Int("layers", config.NumHiddenLayers).Str("url", url).Msg("Found model layers")
+				return config.NumHiddenLayers, nil
+			}
+			if config.NumLayers > 0 {
+				log.Info().Int("layers", config.NumLayers).Str("url", url).Msg("Found model layers")
+				return config.NumLayers, nil
+			}
+			if config.NLayer > 0 {
+				log.Info().Int("layers", config.NLayer).Str("url", url).Msg("Found model layers")
+				return config.NLayer, nil
+			}
+
+			lastErr = fmt.Errorf("no layer count field in config")
+		} else {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("status %d from %s", resp.StatusCode, url)
+		}
 	}
 
-	// Try different field names
-	if config.NumHiddenLayers > 0 {
-		return config.NumHiddenLayers, nil
-	}
-	if config.NumLayers > 0 {
-		return config.NumLayers, nil
-	}
-	if config.NLayer > 0 {
-		return config.NLayer, nil
-	}
-
-	return 0, fmt.Errorf("could not find layer count in config")
+	return 0, lastErr
 }
 
 // Message types
 
 type LoadModelCommand struct {
 	ModelPath    string `json:"model_path"`
+	ModelID      string `json:"model_id"`
 	LayerStart   int    `json:"layer_start"`
 	LayerEnd     int    `json:"layer_end"`
+	TotalLayers  int    `json:"total_layers"`
 	HasEmbedding bool   `json:"has_embedding"`
 	HasLMHead    bool   `json:"has_lm_head"`
 }

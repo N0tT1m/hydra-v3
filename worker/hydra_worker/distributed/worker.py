@@ -241,6 +241,27 @@ class DistributedWorker:
         msg_type = msg.get("type")
 
         if msg_type == "load_model":
+            # Extract layer assignment from load command
+            self.layer_start = msg.get("layer_start", 0)
+            self.layer_end = msg.get("layer_end", 0)
+            total_layers = msg.get("total_layers", 32)
+
+            # Determine position based on layers
+            if self.layer_start == 0:
+                self.position = PipelinePosition.FIRST
+            elif self.layer_end == total_layers:
+                self.position = PipelinePosition.LAST
+            else:
+                self.position = PipelinePosition.MIDDLE
+
+            log.info(
+                "Received load command",
+                model_path=msg.get("model_path"),
+                layer_start=self.layer_start,
+                layer_end=self.layer_end,
+                position=self.position.name,
+            )
+
             await self.load_model(msg["model_path"])
 
         elif msg_type == "topology":
