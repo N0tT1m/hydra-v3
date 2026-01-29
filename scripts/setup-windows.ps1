@@ -165,23 +165,31 @@ Set-Location $ProjectRoot
 # Try to build Go coordinator
 Write-Host ""
 Write-Host "Attempting to build Go coordinator..." -ForegroundColor Green
-Write-Host "(Note: This requires ZeroMQ C library which is complex on Windows)" -ForegroundColor Yellow
 
 New-Item -ItemType Directory -Force -Path "build\bin" | Out-Null
 
-try {
-    $env:CGO_ENABLED = "1"
-    & go mod download 2>&1 | Out-Null
-    & go mod tidy 2>&1 | Out-Null
-    & go build -o build\bin\hydra.exe .\cmd\hydra 2>&1
+# Check for vcpkg ZeroMQ installation
+$vcpkgRoot = "C:\vcpkg"
+$zmqLibDir = "$vcpkgRoot\installed\x64-windows\lib"
+$zmqFound = $false
 
-    if (Test-Path "build\bin\hydra.exe") {
-        Write-Host "  Coordinator built successfully!" -ForegroundColor Green
-    } else {
-        throw "Build failed"
+if (Test-Path $zmqLibDir) {
+    $zmqLibFile = Get-ChildItem -Path $zmqLibDir -Filter "libzmq*.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($zmqLibFile) {
+        $zmqLibName = $zmqLibFile.BaseName
+        $env:CGO_CFLAGS = "-I$vcpkgRoot\installed\x64-windows\include"
+        $env:CGO_LDFLAGS = "-L$zmqLibDir -l$zmqLibName"
+        $env:CGO_ENABLED = "1"
+        if ($env:PATH -notlike "*$vcpkgRoot\installed\x64-windows\bin*") {
+            $env:PATH = "$vcpkgRoot\installed\x64-windows\bin;$env:PATH"
+        }
+        Write-Host "  Found ZeroMQ in vcpkg: $zmqLibName" -ForegroundColor Green
+        $zmqFound = $true
     }
-} catch {
-    Write-Host "  Coordinator build failed (ZeroMQ dependency issue)" -ForegroundColor Yellow
+}
+
+if (-not $zmqFound) {
+    Write-Host "  ZeroMQ not found. Run .\scripts\install-zeromq-windows.ps1 first" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "  RECOMMENDED: Use WSL2 for the coordinator:" -ForegroundColor Cyan
     Write-Host "    1. Install WSL2: wsl --install" -ForegroundColor White
@@ -189,10 +197,23 @@ try {
     Write-Host "    3. In WSL2: ./scripts/run-coordinator.sh" -ForegroundColor White
     Write-Host "    4. On Windows: run workers with .\scripts\run-worker.ps1" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Or install ZeroMQ manually:" -ForegroundColor Cyan
-    Write-Host "    1. Install vcpkg: https://vcpkg.io/en/getting-started.html" -ForegroundColor White
-    Write-Host "    2. vcpkg install zeromq:x64-windows" -ForegroundColor White
-    Write-Host "    3. Set PKG_CONFIG_PATH and rebuild" -ForegroundColor White
+    Write-Host "  Or install ZeroMQ via vcpkg:" -ForegroundColor Cyan
+    Write-Host "    .\scripts\install-zeromq-windows.ps1" -ForegroundColor White
+} else {
+    try {
+        & go mod download 2>&1 | Out-Null
+        & go mod tidy 2>&1 | Out-Null
+        & go build -o build\bin\hydra.exe .\cmd\hydra 2>&1
+
+        if (Test-Path "build\bin\hydra.exe") {
+            Write-Host "  Coordinator built successfully!" -ForegroundColor Green
+        } else {
+            throw "Build failed"
+        }
+    } catch {
+        Write-Host "  Coordinator build failed" -ForegroundColor Yellow
+        Write-Host "  Error: $_" -ForegroundColor Red
+    }
 }
 
 # Create default config if not exists
