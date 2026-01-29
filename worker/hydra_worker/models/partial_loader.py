@@ -3,10 +3,12 @@
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import json
+import os
 import torch
 import torch.nn as nn
 from safetensors import safe_open
 from transformers import AutoConfig, AutoTokenizer
+from huggingface_hub import snapshot_download, hf_hub_download
 import structlog
 
 log = structlog.get_logger()
@@ -145,12 +147,33 @@ class PartialModelLoader:
         device: torch.device = torch.device("cuda"),
         dtype: torch.dtype = torch.float16,
     ):
-        self.model_path = Path(model_path)
         self.device = device
         self.dtype = dtype
+        self.original_model_path = model_path
+
+        # Check if it's a local path or HuggingFace model ID
+        local_path = Path(model_path)
+        if local_path.exists():
+            self.model_path = local_path
+        else:
+            # Download from HuggingFace
+            log.info("Downloading model from HuggingFace", model=model_path)
+            cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+            try:
+                # Download only config and safetensors files first
+                self.model_path = Path(snapshot_download(
+                    model_path,
+                    cache_dir=cache_dir,
+                    allow_patterns=["*.json", "*.safetensors", "*.model", "tokenizer*"],
+                    ignore_patterns=["*.bin", "*.pt", "*.gguf"],
+                ))
+                log.info("Model downloaded", path=str(self.model_path))
+            except Exception as e:
+                log.error("Failed to download model", error=str(e))
+                raise
 
         # Load config
-        self.config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        self.config = AutoConfig.from_pretrained(str(self.model_path), trust_remote_code=True)
         self.arch = self._detect_architecture()
         self.patterns = self.WEIGHT_PATTERNS.get(self.arch, self.WEIGHT_PATTERNS["llama"])
 
