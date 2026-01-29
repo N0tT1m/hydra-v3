@@ -107,19 +107,29 @@ func main() {
 				mID = strings.ToLower(parts[len(parts)-1])
 			}
 
-			// Wait for at least one healthy worker with retries
+			// Wait for healthy workers with stabilization time
 			log.Info().Msg("Waiting for healthy workers before loading model...")
-			for i := 0; i < 30; i++ { // Try for up to 30 seconds
+
+			// First, wait for at least one healthy worker
+			for i := 0; i < 30; i++ {
 				time.Sleep(1 * time.Second)
-				if coord.GetRegistry().HealthyNodeCount() > 0 {
+				count := coord.GetRegistry().HealthyNodeCount()
+				if count > 0 {
+					log.Info().Int("healthy_workers", count).Msg("Found healthy workers, waiting for more to join...")
 					break
 				}
 			}
 
-			if coord.GetRegistry().HealthyNodeCount() == 0 {
-				log.Error().Msg("No healthy workers available after 30s, skipping model load")
+			// Give more workers time to register (additional 5 seconds)
+			time.Sleep(5 * time.Second)
+
+			finalCount := coord.GetRegistry().HealthyNodeCount()
+			if finalCount == 0 {
+				log.Error().Msg("No healthy workers available after 35s, skipping model load")
 				return
 			}
+
+			log.Info().Int("healthy_workers", finalCount).Msg("Proceeding with model load")
 
 			log.Info().
 				Str("model_path", *loadModel).
