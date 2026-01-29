@@ -429,13 +429,24 @@ class PartialModelLoader:
             log.warning("Quantization requested but bitsandbytes not available")
             return layer
 
-        replaced = 0
+        replaced_linears = 0
+        replaced_moe = 0
         failed = 0
 
         def _replace_linears(module: nn.Module, prefix: str = ""):
-            nonlocal replaced, failed
+            nonlocal replaced_linears, replaced_moe, failed
             for name, child in list(module.named_children()):
                 full_name = f"{prefix}.{name}" if prefix else name
+
+                # Check for MoE experts module (has gate_up_proj and down_proj as 3D tensors)
+                if self._is_moe_experts_module(child):
+                    success = self._quantize_moe_experts(child)
+                    if success:
+                        replaced_moe += 1
+                    else:
+                        failed += 1
+                    continue
+
                 if isinstance(child, nn.Linear):
                     # Replace with bitsandbytes quantized linear
                     if self.quant_bits == 8:
@@ -447,21 +458,186 @@ class PartialModelLoader:
 
                     if quantized_linear is not None:
                         setattr(module, name, quantized_linear)
-                        replaced += 1
+                        replaced_linears += 1
                     else:
                         failed += 1
                 else:
-                    # Recursively quantize nested modules (e.g., MoE experts)
+                    # Recursively quantize nested modules
                     _replace_linears(child, full_name)
 
         _replace_linears(layer)
 
-        if replaced > 0 or failed > 0:
+        if replaced_linears > 0 or replaced_moe > 0 or failed > 0:
             log.debug(
-                f"Quantization: replaced {replaced} linear layers, {failed} failed"
+                f"Quantization: {replaced_linears} linears, {replaced_moe} MoE experts, {failed} failed"
             )
 
         return layer
+
+    def _is_moe_experts_module(self, module: nn.Module) -> bool:
+        """Check if module is an MoE experts container (Qwen3MoeExperts, etc.)."""
+        # Check for 3D weight tensors that indicate MoE experts
+        has_gate_up = hasattr(module, 'gate_up_proj') and isinstance(
+            getattr(module, 'gate_up_proj', None), (nn.Parameter, torch.Tensor)
+        )
+        has_down = hasattr(module, 'down_proj') and isinstance(
+            getattr(module, 'down_proj', None), (nn.Parameter, torch.Tensor)
+        )
+
+        if has_gate_up and has_down:
+            gate_up = module.gate_up_proj
+            down = module.down_proj
+            # MoE experts have 3D weight tensors: (num_experts, out_features, in_features)
+            return len(gate_up.shape) == 3 and len(down.shape) == 3
+
+        return False
+
+    def _quantize_moe_experts(self, experts_module: nn.Module) -> bool:
+        """Quantize MoE expert weight tensors in-place."""
+        try:
+            # Get the expert weight tensors
+            gate_up = experts_module.gate_up_proj.data
+            down = experts_module.down_proj.data
+
+            num_experts = gate_up.shape[0]
+            original_size = (gate_up.numel() + down.numel()) * gate_up.element_size()
+
+            if self.quant_bits == 8:
+                # Quantize to int8 with per-expert scale
+                gate_up_q, gate_up_scale = self._quantize_tensor_int8(gate_up)
+                down_q, down_scale = self._quantize_tensor_int8(down)
+
+                # Delete original tensors to free memory
+                del gate_up, down
+                gc.collect()
+
+                # Store quantized versions
+                experts_module.register_buffer('gate_up_proj_q', gate_up_q)
+                experts_module.register_buffer('down_proj_q', down_q)
+                experts_module.register_buffer('gate_up_scale', gate_up_scale.view(num_experts, 1, 1))
+                experts_module.register_buffer('down_scale', down_scale.view(num_experts, 1, 1))
+
+                # Replace original params with dummy to free memory
+                experts_module.gate_up_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+                experts_module.down_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+
+                experts_module._quantized = True
+                experts_module._quant_bits = 8
+
+            elif self.quant_bits == 4:
+                # 4-bit quantization
+                gate_up_q, gate_up_scale = self._quantize_tensor_int4(gate_up)
+                down_q, down_scale = self._quantize_tensor_int4(down)
+
+                del gate_up, down
+                gc.collect()
+
+                experts_module.register_buffer('gate_up_proj_q', gate_up_q)
+                experts_module.register_buffer('down_proj_q', down_q)
+                experts_module.register_buffer('gate_up_scale', gate_up_scale.view(num_experts, 1, 1))
+                experts_module.register_buffer('down_scale', down_scale.view(num_experts, 1, 1))
+
+                experts_module.gate_up_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+                experts_module.down_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+
+                experts_module._quantized = True
+                experts_module._quant_bits = 4
+
+            # Patch the module's forward to handle quantized weights
+            self._wrap_moe_experts_forward(experts_module)
+
+            gc.collect()
+
+            quantized_size = (
+                experts_module.gate_up_proj_q.numel() * experts_module.gate_up_proj_q.element_size() +
+                experts_module.down_proj_q.numel() * experts_module.down_proj_q.element_size()
+            )
+
+            log.debug(
+                f"Quantized MoE experts: {num_experts} experts, "
+                f"{original_size / 1e6:.1f}MB -> {quantized_size / 1e6:.1f}MB"
+            )
+            return True
+
+        except Exception as e:
+            log.warning(f"Failed to quantize MoE experts: {e}", exc_info=True)
+            return False
+
+    def _quantize_tensor_int4(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a tensor to int4 (stored as int8) with per-expert scale."""
+        if len(tensor.shape) == 3:
+            scales = tensor.abs().amax(dim=(1, 2), keepdim=True) / 7.0
+            scales = scales.clamp(min=1e-8)
+        else:
+            scales = tensor.abs().max() / 7.0
+            scales = torch.tensor([max(scales, 1e-8)])
+
+        quantized = (tensor / scales).round().clamp(-7, 7).to(torch.int8)
+        return quantized, scales.to(torch.float16).squeeze()
+
+    def _wrap_moe_experts_forward(self, experts_module: nn.Module):
+        """Wrap MoE experts to dequantize weights during forward pass."""
+        original_class = type(experts_module)
+
+        # Store original forward
+        if not hasattr(experts_module, '_orig_forward'):
+            experts_module._orig_forward = experts_module.forward
+
+        def dequantized_forward(hidden_states, expert_idx=None):
+            """Forward with on-the-fly dequantization."""
+            if not hasattr(experts_module, '_quantized') or not experts_module._quantized:
+                return experts_module._orig_forward(hidden_states, expert_idx)
+
+            # Get quantized weights
+            gate_up_q = experts_module.gate_up_proj_q
+            down_q = experts_module.down_proj_q
+            gate_up_scale = experts_module.gate_up_scale
+            down_scale = experts_module.down_scale
+
+            # Dequantize for the selected expert(s)
+            if expert_idx is not None:
+                # Single expert
+                gate_up_w = gate_up_q[expert_idx].to(hidden_states.dtype) * gate_up_scale[expert_idx].to(hidden_states.dtype)
+                down_w = down_q[expert_idx].to(hidden_states.dtype) * down_scale[expert_idx].to(hidden_states.dtype)
+
+                # Apply the MLP: gate_up -> split -> silu(gate) * up -> down
+                intermediate = torch.nn.functional.linear(hidden_states, gate_up_w)
+                gate, up = intermediate.chunk(2, dim=-1)
+                intermediate = torch.nn.functional.silu(gate) * up
+                return torch.nn.functional.linear(intermediate, down_w)
+            else:
+                # Batch processing - dequantize all
+                gate_up_w = gate_up_q.to(hidden_states.dtype) * gate_up_scale.to(hidden_states.dtype)
+                down_w = down_q.to(hidden_states.dtype) * down_scale.to(hidden_states.dtype)
+
+                # Temporarily restore full weights for original forward
+                experts_module.gate_up_proj = nn.Parameter(gate_up_w, requires_grad=False)
+                experts_module.down_proj = nn.Parameter(down_w, requires_grad=False)
+
+                try:
+                    result = experts_module._orig_forward(hidden_states)
+                finally:
+                    # Restore dummy params
+                    experts_module.gate_up_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+                    experts_module.down_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+
+                return result
+
+        experts_module.forward = dequantized_forward
+
+    def _quantize_tensor_int8(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Quantize a tensor to int8 with per-tensor scale."""
+        # Compute scale per expert (first dimension)
+        if len(tensor.shape) == 3:
+            # Per-expert scaling for MoE
+            scales = tensor.abs().amax(dim=(1, 2), keepdim=True) / 127.0
+            scales = scales.clamp(min=1e-8)
+        else:
+            scales = tensor.abs().max() / 127.0
+            scales = max(scales, 1e-8)
+
+        quantized = (tensor / scales).round().clamp(-127, 127).to(torch.int8)
+        return quantized, scales.to(torch.float16).squeeze()
 
     def _create_int8_linear(self, linear: nn.Linear) -> Optional[nn.Module]:
         """Create an int8 quantized linear layer from a regular linear layer."""
