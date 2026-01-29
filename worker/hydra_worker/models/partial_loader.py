@@ -88,16 +88,17 @@ class PartialTransformer(nn.Module):
         return hidden_states, new_past_key_values
 
 
-def parse_dtype(dtype_str: str) -> torch.dtype:
-    """Parse dtype string to torch dtype."""
-    return {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-        "int8": torch.float16,  # Base dtype, quantization handled separately
-        "int4": torch.bfloat16,
-        "fp8": torch.float16,
-    }.get(dtype_str, torch.bfloat16)
+def parse_dtype(dtype_str: str) -> Tuple[torch.dtype, bool, int]:
+    """Parse dtype string to (torch dtype, is_quantized, bits)."""
+    dtype_map = {
+        "float16": (torch.float16, False, 16),
+        "bfloat16": (torch.bfloat16, False, 16),
+        "float32": (torch.float32, False, 32),
+        "int8": (torch.float16, True, 8),
+        "int4": (torch.bfloat16, True, 4),
+        "fp8": (torch.float16, True, 8),
+    }
+    return dtype_map.get(dtype_str, (torch.bfloat16, False, 16))
 
 
 class PartialModelLoader:
@@ -116,10 +117,12 @@ class PartialModelLoader:
         self.device = device
 
         if isinstance(dtype, str):
-            self.dtype = parse_dtype(dtype)
+            self.dtype, self.quantize, self.quant_bits = parse_dtype(dtype)
             self.dtype_str = dtype
         else:
             self.dtype = dtype
+            self.quantize = False
+            self.quant_bits = 16
             self.dtype_str = str(dtype).split(".")[-1]
 
         self.original_model_path = model_path
@@ -367,6 +370,9 @@ class PartialModelLoader:
             short_name = name.replace(f"{self._get_layer_prefix()}{layer_idx}.", "")
             tensor = self._load_tensor(name)
             if tensor is not None:
+                # Apply quantization if requested
+                if self.quantize and tensor.numel() > 1024:  # Only quantize larger tensors
+                    tensor = self._quantize_tensor(tensor)
                 weights[short_name] = tensor
 
         # Create the appropriate layer based on model type
@@ -381,6 +387,26 @@ class PartialModelLoader:
             layer = self._create_generic_layer(layer_idx, weights)
 
         return layer.to(self.device)
+
+    def _quantize_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Quantize a tensor to int8 or int4."""
+        if self.quant_bits == 8:
+            # Simple int8 quantization
+            scale = tensor.abs().max() / 127.0
+            if scale == 0:
+                return tensor.to(self.dtype)
+            quantized = (tensor / scale).round().clamp(-127, 127).to(torch.int8)
+            # Store as float for now (proper int8 inference needs special kernels)
+            return (quantized.float() * scale).to(self.dtype)
+        elif self.quant_bits == 4:
+            # Simple int4-like quantization (stored as int8)
+            scale = tensor.abs().max() / 7.0
+            if scale == 0:
+                return tensor.to(self.dtype)
+            quantized = (tensor / scale).round().clamp(-7, 7).to(torch.int8)
+            return (quantized.float() * scale).to(self.dtype)
+        else:
+            return tensor.to(self.dtype)
 
     def _create_qwen_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
         """Create a Qwen/Qwen2 layer."""
