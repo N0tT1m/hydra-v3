@@ -72,10 +72,24 @@ func main() {
 
 	log.Info().Msg("Hydra coordinator started successfully")
 
-	// Start local worker if requested
+	// Start local worker if requested (CLI flag overrides config)
 	var workerCmd *exec.Cmd
-	if *withLocalWorker {
-		workerCmd = startLocalWorker(*workerNodeID, *workerDevice, cfg.ZMQ.RouterAddr)
+	startWorker := *withLocalWorker || cfg.LocalWorker.Enabled
+	workerNode := *workerNodeID
+	workerDev := *workerDevice
+
+	// Use config values if CLI flags are defaults
+	if !*withLocalWorker && cfg.LocalWorker.Enabled {
+		if cfg.LocalWorker.NodeID != "" {
+			workerNode = cfg.LocalWorker.NodeID
+		}
+		if cfg.LocalWorker.Device != "" {
+			workerDev = cfg.LocalWorker.Device
+		}
+	}
+
+	if startWorker {
+		workerCmd = startLocalWorker(workerNode, workerDev, cfg.ZMQ.RouterAddr)
 	}
 
 	// Wait for shutdown signal

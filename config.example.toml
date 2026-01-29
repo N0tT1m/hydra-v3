@@ -27,3 +27,9 @@ high_water_mark = 1000
 cache_dir = "~/.cache/hydra/models"
 # hf_token = "your_huggingface_token"
 max_cache_gb = 100
+
+[local_worker]
+# Start a local Python worker with the coordinator
+enabled = false
+node_id = "local-worker"
+device = "auto"  # auto, cuda:0, cuda:1, mps, cpu

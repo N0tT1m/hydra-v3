@@ -8,11 +8,19 @@ import (
 
 // Config holds the complete configuration for the coordinator
 type Config struct {
-	Server  ServerConfig  `mapstructure:"server"`
-	Cluster ClusterConfig `mapstructure:"cluster"`
-	Auth    AuthConfig    `mapstructure:"auth"`
-	ZMQ     ZMQConfig     `mapstructure:"zmq"`
-	Model   ModelConfig   `mapstructure:"model"`
+	Server      ServerConfig      `mapstructure:"server"`
+	Cluster     ClusterConfig     `mapstructure:"cluster"`
+	Auth        AuthConfig        `mapstructure:"auth"`
+	ZMQ         ZMQConfig         `mapstructure:"zmq"`
+	Model       ModelConfig       `mapstructure:"model"`
+	LocalWorker LocalWorkerConfig `mapstructure:"local_worker"`
+}
+
+// LocalWorkerConfig holds local worker configuration
+type LocalWorkerConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	NodeID  string `mapstructure:"node_id"`
+	Device  string `mapstructure:"device"`
 }
 
 // ServerConfig holds HTTP server configuration
@@ -78,6 +86,10 @@ func Load(path string) (*Config, error) {
 
 	v.SetDefault("model.cache_dir", "~/.cache/hydra/models")
 	v.SetDefault("model.max_cache_gb", 100)
+
+	v.SetDefault("local_worker.enabled", false)
+	v.SetDefault("local_worker.node_id", "local-worker")
+	v.SetDefault("local_worker.device", "auto")
 
 	// Read config file
 	v.SetConfigFile(path)
