@@ -10,124 +10,194 @@ Write-Host "==========================================" -ForegroundColor Cyan
 # Check for Administrator privileges
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host "WARNING: Not running as Administrator. Some installations may fail." -ForegroundColor Yellow
+    Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
+    Write-Host "Right-click PowerShell and select 'Run as Administrator'" -ForegroundColor Yellow
+    exit 1
+}
+
+# Function to refresh environment variables
+function Refresh-Environment {
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+    # Also refresh ChocolateyInstall
+    $chocoPath = [System.Environment]::GetEnvironmentVariable("ChocolateyInstall", "Machine")
+    if ($chocoPath) {
+        $env:ChocolateyInstall = $chocoPath
+        $env:Path = "$chocoPath\bin;" + $env:Path
+    }
 }
 
 # Check for Chocolatey
-if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+$chocoInstalled = $false
+$chocoPath = "$env:ProgramData\chocolatey\bin\choco.exe"
+
+if (Test-Path $chocoPath) {
+    $chocoInstalled = $true
+    Write-Host "Chocolatey already installed." -ForegroundColor Green
+} elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+    $chocoInstalled = $true
+    Write-Host "Chocolatey already installed." -ForegroundColor Green
+}
+
+if (-not $chocoInstalled) {
     Write-Host "Installing Chocolatey..." -ForegroundColor Green
     Set-ExecutionPolicy Bypass -Scope Process -Force
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
     Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-
-    # Refresh environment
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 }
 
-# Install dependencies via Chocolatey
+# Refresh environment to get choco in path
+Refresh-Environment
+
+# Verify choco is available
+if (-not (Test-Path "$env:ProgramData\chocolatey\bin\choco.exe")) {
+    Write-Host "ERROR: Chocolatey installation failed or not found." -ForegroundColor Red
+    Write-Host "Please install Chocolatey manually: https://chocolatey.org/install" -ForegroundColor Yellow
+    exit 1
+}
+
+# Use full path to choco
+$choco = "$env:ProgramData\chocolatey\bin\choco.exe"
+
 Write-Host "Installing system dependencies..." -ForegroundColor Green
 
 # Install Go
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
+Write-Host "Checking Go..." -ForegroundColor Green
+$goInstalled = Get-Command go -ErrorAction SilentlyContinue
+if (-not $goInstalled) {
     Write-Host "Installing Go..." -ForegroundColor Green
-    choco install golang -y
+    & $choco install golang -y --no-progress
+    Refresh-Environment
 }
 
 # Install Python
-if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    Write-Host "Installing Python..." -ForegroundColor Green
-    choco install python311 -y
+Write-Host "Checking Python..." -ForegroundColor Green
+$pythonInstalled = Get-Command python -ErrorAction SilentlyContinue
+if (-not $pythonInstalled) {
+    Write-Host "Installing Python 3.11..." -ForegroundColor Green
+    & $choco install python311 -y --no-progress
+    Refresh-Environment
 }
 
-# Install pkg-config and ZeroMQ
-Write-Host "Installing ZeroMQ..." -ForegroundColor Green
-choco install pkgconfiglite -y
-
-# For ZeroMQ on Windows, we need vcpkg or manual installation
-# Using pre-built binaries approach
-$zmqUrl = "https://github.com/zeromq/libzmq/releases/download/v4.3.5/zeromq-4.3.5.zip"
-$zmqDir = "$env:LOCALAPPDATA\zeromq"
-
-if (-not (Test-Path "$zmqDir\bin\libzmq.dll")) {
-    Write-Host "Downloading ZeroMQ..." -ForegroundColor Green
-
-    $zmqZip = "$env:TEMP\zeromq.zip"
-    Invoke-WebRequest -Uri $zmqUrl -OutFile $zmqZip
-
-    New-Item -ItemType Directory -Force -Path $zmqDir | Out-Null
-    Expand-Archive -Path $zmqZip -DestinationPath $zmqDir -Force
-    Remove-Item $zmqZip
-
-    # Add to PATH
-    $env:Path += ";$zmqDir\bin"
-    [Environment]::SetEnvironmentVariable("Path", $env:Path, "User")
-
-    # Set PKG_CONFIG_PATH
-    [Environment]::SetEnvironmentVariable("PKG_CONFIG_PATH", "$zmqDir\lib\pkgconfig", "User")
+# Install Git if not present
+Write-Host "Checking Git..." -ForegroundColor Green
+$gitInstalled = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitInstalled) {
+    Write-Host "Installing Git..." -ForegroundColor Green
+    & $choco install git -y --no-progress
+    Refresh-Environment
 }
 
-# Refresh environment
-$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+# Install pkg-config
+Write-Host "Installing pkg-config..." -ForegroundColor Green
+& $choco install pkgconfiglite -y --no-progress 2>$null
+Refresh-Environment
 
-Write-Host "Go version: $(go version)" -ForegroundColor Green
-Write-Host "Python version: $(python --version)" -ForegroundColor Green
+# Refresh one more time
+Refresh-Environment
+
+# Verify installations
+Write-Host ""
+Write-Host "Verifying installations..." -ForegroundColor Green
+
+try {
+    $goVersion = & go version 2>&1
+    Write-Host "  Go: $goVersion" -ForegroundColor Cyan
+} catch {
+    Write-Host "  Go: NOT FOUND - please install manually" -ForegroundColor Red
+}
+
+try {
+    $pythonVersion = & python --version 2>&1
+    Write-Host "  Python: $pythonVersion" -ForegroundColor Cyan
+} catch {
+    Write-Host "  Python: NOT FOUND - please install manually" -ForegroundColor Red
+}
 
 # Get project root
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 Set-Location $ProjectRoot
 
-# Build Go coordinator
-Write-Host "Building Go coordinator..." -ForegroundColor Green
+Write-Host ""
+Write-Host "Project root: $ProjectRoot" -ForegroundColor Cyan
 
-go mod download
-go mod tidy
-
-New-Item -ItemType Directory -Force -Path "build\bin" | Out-Null
-
-$env:CGO_ENABLED = "1"
-go build -o build\bin\hydra.exe .\cmd\hydra
-
-if (Test-Path "build\bin\hydra.exe") {
-    Write-Host "Coordinator built successfully: build\bin\hydra.exe" -ForegroundColor Green
-} else {
-    Write-Host "Coordinator build failed" -ForegroundColor Red
-    Write-Host "Note: ZeroMQ CGO build on Windows can be tricky." -ForegroundColor Yellow
-    Write-Host "Consider using WSL2 for easier setup." -ForegroundColor Yellow
-}
-
-# Setup Python virtual environment
+# Setup Python virtual environment first (doesn't require ZMQ)
+Write-Host ""
 Write-Host "Setting up Python virtual environment..." -ForegroundColor Green
 Set-Location worker
 
 if (-not (Test-Path "venv")) {
-    python -m venv venv
+    & python -m venv venv
 }
 
+# Activate and install
 & .\venv\Scripts\Activate.ps1
 
 # Upgrade pip
-python -m pip install --upgrade pip
+& python -m pip install --upgrade pip --quiet
 
 # Install worker package
-Write-Host "Installing Python worker..." -ForegroundColor Green
-pip install -e .
+Write-Host "Installing Python worker dependencies..." -ForegroundColor Green
+& pip install -e . --quiet
 
 # Check for CUDA
-$cudaAvailable = python -c "import torch; print(torch.cuda.is_available())" 2>$null
-if ($cudaAvailable -eq "True") {
-    Write-Host "CUDA is available" -ForegroundColor Green
-    python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
-} else {
-    Write-Host "CUDA not detected. Install PyTorch with CUDA support for GPU acceleration:" -ForegroundColor Yellow
-    Write-Host "  pip install torch --index-url https://download.pytorch.org/whl/cu118" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Checking GPU support..." -ForegroundColor Green
+try {
+    $cudaCheck = & python -c "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')" 2>&1
+    if ($cudaCheck -eq "CUDA") {
+        Write-Host "  CUDA is available" -ForegroundColor Green
+        $gpuName = & python -c "import torch; print(torch.cuda.get_device_name(0))" 2>&1
+        Write-Host "  GPU: $gpuName" -ForegroundColor Cyan
+    } else {
+        Write-Host "  CUDA not detected. Using CPU." -ForegroundColor Yellow
+        Write-Host "  For GPU support, install PyTorch with CUDA:" -ForegroundColor Yellow
+        Write-Host "    pip install torch --index-url https://download.pytorch.org/whl/cu118" -ForegroundColor White
+    }
+} catch {
+    Write-Host "  Could not detect GPU support" -ForegroundColor Yellow
 }
 
-deactivate
+& deactivate
 Set-Location $ProjectRoot
+
+# Try to build Go coordinator
+Write-Host ""
+Write-Host "Attempting to build Go coordinator..." -ForegroundColor Green
+Write-Host "(Note: This requires ZeroMQ C library which is complex on Windows)" -ForegroundColor Yellow
+
+New-Item -ItemType Directory -Force -Path "build\bin" | Out-Null
+
+try {
+    $env:CGO_ENABLED = "1"
+    & go mod download 2>&1 | Out-Null
+    & go mod tidy 2>&1 | Out-Null
+    & go build -o build\bin\hydra.exe .\cmd\hydra 2>&1
+
+    if (Test-Path "build\bin\hydra.exe") {
+        Write-Host "  Coordinator built successfully!" -ForegroundColor Green
+    } else {
+        throw "Build failed"
+    }
+} catch {
+    Write-Host "  Coordinator build failed (ZeroMQ dependency issue)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  RECOMMENDED: Use WSL2 for the coordinator:" -ForegroundColor Cyan
+    Write-Host "    1. Install WSL2: wsl --install" -ForegroundColor White
+    Write-Host "    2. In WSL2: ./scripts/setup-linux.sh" -ForegroundColor White
+    Write-Host "    3. In WSL2: ./scripts/run-coordinator.sh" -ForegroundColor White
+    Write-Host "    4. On Windows: run workers with .\scripts\run-worker.ps1" -ForegroundColor White
+    Write-Host ""
+    Write-Host "  Or install ZeroMQ manually:" -ForegroundColor Cyan
+    Write-Host "    1. Install vcpkg: https://vcpkg.io/en/getting-started.html" -ForegroundColor White
+    Write-Host "    2. vcpkg install zeromq:x64-windows" -ForegroundColor White
+    Write-Host "    3. Set PKG_CONFIG_PATH and rebuild" -ForegroundColor White
+}
 
 # Create default config if not exists
 if (-not (Test-Path "config.toml")) {
+    Write-Host ""
     Write-Host "Creating default configuration..." -ForegroundColor Green
     Copy-Item "config.example.toml" "config.toml"
 }
@@ -137,13 +207,17 @@ Write-Host "==========================================" -ForegroundColor Green
 Write-Host "  Setup Complete!" -ForegroundColor Green
 Write-Host "==========================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "To start the coordinator:"
-Write-Host "  .\scripts\run-coordinator.bat"
+Write-Host "Python worker is ready to use." -ForegroundColor Green
 Write-Host ""
-Write-Host "To start a worker:"
-Write-Host "  .\scripts\run-worker.bat --node-id worker-1"
+Write-Host "To start a worker:" -ForegroundColor Cyan
+Write-Host "  .\scripts\run-worker.ps1 -NodeId worker-1" -ForegroundColor White
 Write-Host ""
-Write-Host "Or manually:"
-Write-Host "  .\build\bin\hydra.exe -config config.toml"
-Write-Host "  cd worker; .\venv\Scripts\Activate.ps1; hydra-worker start --node-id worker-1"
+Write-Host "For the coordinator, we recommend WSL2:" -ForegroundColor Cyan
+Write-Host "  wsl --install                         # Install WSL2" -ForegroundColor White
+Write-Host "  wsl                                    # Enter WSL2" -ForegroundColor White
+Write-Host "  cd /mnt/d/workspace/ai-apps/hydra-v3  # Navigate to project" -ForegroundColor White
+Write-Host "  ./scripts/setup-linux.sh              # Setup in Linux" -ForegroundColor White
+Write-Host "  ./scripts/run-coordinator.sh          # Run coordinator" -ForegroundColor White
+Write-Host ""
+Write-Host "The coordinator in WSL2 will be accessible from Windows at localhost:8080" -ForegroundColor Yellow
 Write-Host ""
