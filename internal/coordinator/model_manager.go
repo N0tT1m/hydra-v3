@@ -207,8 +207,8 @@ func (m *ModelManager) GetModelDistribution(modelID string) []LayerAssignment {
 
 // fetchModelLayers fetches the model config from HuggingFace and returns the layer count
 func (m *ModelManager) fetchModelLayers(modelPath string) (int, error) {
-	// HuggingFace config.json URL
-	url := fmt.Sprintf("https://huggingface.co/%s/raw/main/config.json", modelPath)
+	// HuggingFace config.json URL (use resolve instead of raw for better compatibility)
+	url := fmt.Sprintf("https://huggingface.co/%s/resolve/main/config.json", modelPath)
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, err := http.NewRequest("GET", url, nil)
