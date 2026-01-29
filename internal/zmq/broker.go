@@ -239,16 +239,21 @@ func (b *Broker) SendTo(nodeID string, msgType MessageType, payload interface{})
 		return fmt.Errorf("worker %s not registered", nodeID)
 	}
 
+	// Convert payload to map and add type field
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	msg := Message{
-		Type:    msgType,
-		NodeID:  nodeID,
-		Payload: payloadBytes,
+	// Create flattened message with string type
+	var msg map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &msg); err != nil {
+		msg = make(map[string]interface{})
 	}
+
+	// Add type as string for Python compatibility
+	msg["type"] = string(msgType)
+	msg["node_id"] = nodeID
 
 	data, err := json.Marshal(msg)
 	if err != nil {
