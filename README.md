@@ -66,16 +66,60 @@ sudo apt-get install -y libzmq3-dev pkg-config
 sudo yum install -y zeromq-devel pkgconfig
 ```
 
+## Quick Start
+
+The fastest way to get started is using the setup scripts:
+
+**macOS:**
+```bash
+git clone https://github.com/your-org/hydra-v3.git
+cd hydra-v3
+./scripts/setup-macos.sh
+./scripts/quick-start.sh
+```
+
+**Linux:**
+```bash
+git clone https://github.com/your-org/hydra-v3.git
+cd hydra-v3
+./scripts/setup-linux.sh
+./scripts/quick-start.sh
+```
+
+**Windows (PowerShell as Administrator):**
+```powershell
+git clone https://github.com/your-org/hydra-v3.git
+cd hydra-v3
+.\scripts\setup-windows.ps1
+.\scripts\quick-start.ps1
+```
+
 ## Installation
 
-### 1. Clone the Repository
+### Option 1: Using Setup Scripts (Recommended)
+
+| Platform | Script |
+|----------|--------|
+| macOS | `./scripts/setup-macos.sh` |
+| Linux (Ubuntu/Debian/RHEL) | `./scripts/setup-linux.sh` |
+| Windows | `.\scripts\setup-windows.ps1` |
+
+These scripts will:
+1. Install system dependencies (ZeroMQ, Go, Python)
+2. Build the Go coordinator
+3. Set up Python virtual environment
+4. Install the worker package
+
+### Option 2: Manual Installation
+
+#### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/your-org/hydra-v3.git
 cd hydra-v3
 ```
 
-### 2. Build the Coordinator
+#### 2. Build the Coordinator
 
 ```bash
 # Download Go dependencies
@@ -85,7 +129,7 @@ make deps
 make build
 ```
 
-### 3. Install the Python Worker
+#### 3. Install the Python Worker
 
 ```bash
 cd worker
@@ -344,6 +388,48 @@ The coordinator distributes layers proportionally based on available VRAM:
 - Worker 2: Layers 5-17 (middle 13 layers)
 - Worker 3: Layers 18-31 (last 14 layers + lm_head)
 
+## Scripts Reference
+
+All scripts are located in the `scripts/` directory.
+
+### Setup Scripts
+
+| Script | Platform | Description |
+|--------|----------|-------------|
+| `setup-macos.sh` | macOS | Install Homebrew, ZeroMQ, Go, Python; build coordinator; setup worker |
+| `setup-linux.sh` | Linux | Install via apt/dnf/yum; build coordinator; setup worker |
+| `setup-windows.ps1` | Windows | Install via Chocolatey; build coordinator; setup worker |
+
+### Run Scripts
+
+| Script | Platform | Description |
+|--------|----------|-------------|
+| `run-coordinator.sh` | macOS/Linux | Start the coordinator |
+| `run-coordinator.bat` | Windows CMD | Start the coordinator |
+| `run-coordinator.ps1` | Windows PS | Start the coordinator |
+| `run-worker.sh` | macOS/Linux | Start a worker with options |
+| `run-worker.bat` | Windows CMD | Start a worker with options |
+| `run-worker.ps1` | Windows PS | Start a worker with options |
+| `quick-start.sh` | macOS/Linux | Start coordinator + 1 worker for testing |
+| `quick-start.ps1` | Windows | Start coordinator + 1 worker for testing |
+
+### Worker Script Options
+
+```bash
+./scripts/run-worker.sh [OPTIONS]
+
+Options:
+  --node-id, -n       Unique worker ID (required)
+  --coordinator, -c   Coordinator address (default: tcp://localhost:5555)
+  --device, -d        Device: auto, cuda:0, cuda:1, mps, cpu (default: auto)
+  --dtype             Data type: float16, bfloat16, float32 (default: float16)
+  --pipeline-port, -p Pipeline port (default: 6000)
+
+Examples:
+  ./scripts/run-worker.sh --node-id worker-1
+  ./scripts/run-worker.sh --node-id worker-2 --device cuda:1 --pipeline-port 6001
+```
+
 ## Project Structure
 
 ```
@@ -371,6 +457,13 @@ hydra-v3/
 │   │   ├── distributed/           # Pipeline, worker
 │   │   └── inference/             # Generation engine
 │   └── pyproject.toml
+├── scripts/                       # Setup and run scripts
+│   ├── setup-macos.sh             # macOS setup
+│   ├── setup-linux.sh             # Linux setup
+│   ├── setup-windows.ps1          # Windows setup
+│   ├── run-coordinator.sh/.bat/.ps1  # Start coordinator
+│   ├── run-worker.sh/.bat/.ps1    # Start worker
+│   └── quick-start.sh/.ps1        # Quick test setup
 ├── examples/                      # Usage examples
 ├── config.example.toml            # Example configuration
 └── Makefile                       # Build commands
