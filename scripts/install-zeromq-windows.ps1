@@ -90,15 +90,15 @@ Write-Host "Installing ZeroMQ (this may take a few minutes)..." -ForegroundColor
 Set-Location $vcpkgRoot
 .\vcpkg install zeromq:x64-windows
 
-if (-not (Test-Path "$vcpkgRoot\installed\x64-windows\lib\libzmq.lib")) {
-    # Try alternative name
-    if (-not (Test-Path "$vcpkgRoot\installed\x64-windows\lib\zmq.lib")) {
-        Write-Host "ERROR: ZeroMQ installation failed" -ForegroundColor Red
-        exit 1
-    }
+# Check for ZeroMQ library - vcpkg uses versioned names like libzmq-mt-4_3_5.lib
+$zmqLibs = Get-ChildItem -Path "$vcpkgRoot\installed\x64-windows\lib" -Filter "*zmq*.lib" -ErrorAction SilentlyContinue
+if (-not $zmqLibs) {
+    Write-Host "ERROR: ZeroMQ installation failed - no library files found" -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "ZeroMQ installed successfully" -ForegroundColor Green
+Write-Host "  Found library: $($zmqLibs[0].Name)" -ForegroundColor Cyan
 
 # Integrate vcpkg
 Write-Host ""
@@ -113,9 +113,19 @@ $zmqInclude = "$vcpkgRoot\installed\x64-windows\include"
 $zmqLib = "$vcpkgRoot\installed\x64-windows\lib"
 $zmqBin = "$vcpkgRoot\installed\x64-windows\bin"
 
+# Find the actual library name (vcpkg uses versioned names like libzmq-mt-4_3_5.lib)
+$zmqLibFile = Get-ChildItem -Path $zmqLib -Filter "libzmq*.lib" | Select-Object -First 1
+if ($zmqLibFile) {
+    # Extract library name without .lib extension for linker
+    $zmqLibName = $zmqLibFile.BaseName
+    Write-Host "  Using library: $zmqLibName" -ForegroundColor Cyan
+} else {
+    $zmqLibName = "zmq"
+}
+
 # Set for current session
 $env:CGO_CFLAGS = "-I$zmqInclude"
-$env:CGO_LDFLAGS = "-L$zmqLib -lzmq"
+$env:CGO_LDFLAGS = "-L$zmqLib -l$zmqLibName"
 $env:CGO_ENABLED = "1"
 
 # Add to PATH for current session
@@ -125,7 +135,7 @@ if ($env:PATH -notlike "*$zmqBin*") {
 
 # Set permanently (User level)
 [System.Environment]::SetEnvironmentVariable("CGO_CFLAGS", "-I$zmqInclude", "User")
-[System.Environment]::SetEnvironmentVariable("CGO_LDFLAGS", "-L$zmqLib -lzmq", "User")
+[System.Environment]::SetEnvironmentVariable("CGO_LDFLAGS", "-L$zmqLib -l$zmqLibName", "User")
 [System.Environment]::SetEnvironmentVariable("CGO_ENABLED", "1", "User")
 
 # Add vcpkg bin to PATH permanently
@@ -143,7 +153,7 @@ $envScript = @"
 # Source this before building: . .\scripts\zmq-env.ps1
 
 `$env:CGO_CFLAGS = "-I$zmqInclude"
-`$env:CGO_LDFLAGS = "-L$zmqLib -lzmq"
+`$env:CGO_LDFLAGS = "-L$zmqLib -l$zmqLibName"
 `$env:CGO_ENABLED = "1"
 `$env:PATH = "$zmqBin;`$env:PATH"
 
@@ -159,7 +169,7 @@ Write-Host "==========================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Environment variables set:" -ForegroundColor Cyan
 Write-Host "  CGO_CFLAGS = -I$zmqInclude" -ForegroundColor White
-Write-Host "  CGO_LDFLAGS = -L$zmqLib -lzmq" -ForegroundColor White
+Write-Host "  CGO_LDFLAGS = -L$zmqLib -l$zmqLibName" -ForegroundColor White
 Write-Host "  PATH includes $zmqBin" -ForegroundColor White
 Write-Host ""
 Write-Host "Now build the coordinator:" -ForegroundColor Yellow
