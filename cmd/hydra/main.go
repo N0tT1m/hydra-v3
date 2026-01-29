@@ -116,7 +116,7 @@ func main() {
 				Int("layers", *modelLayers).
 				Msg("Auto-loading model")
 
-			err := coord.GetModelManager().LoadModel(*loadModel, mID, *modelLayers)
+			err := coord.GetModelManager().LoadModel(ctx, *loadModel, mID, *modelLayers)
 			if err != nil {
 				log.Error().Err(err).Msg("Failed to auto-load model")
 			} else {
