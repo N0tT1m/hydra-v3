@@ -2,18 +2,19 @@
 
 param(
     [Parameter(Mandatory=$true)]
-    [Alias("n")]
+    [Alias("n", "node-id")]
     [string]$NodeId,
 
-    [Alias("c")]
+    [Alias("c", "coordinator")]
     [string]$Coordinator = "tcp://localhost:5555",
 
-    [Alias("d")]
+    [Alias("d", "device")]
     [string]$Device = "auto",
 
+    [Alias("dtype")]
     [string]$Dtype = "float16",
 
-    [Alias("p")]
+    [Alias("p", "pipeline-port")]
     [int]$PipelinePort = 6000
 )
 

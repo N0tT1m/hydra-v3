@@ -1,5 +1,7 @@
 # Run the Hydra coordinator (Windows PowerShell)
+# Supports both PowerShell-style (-WithLocalWorker) and Unix-style (--with-local-worker) parameters
 
+[CmdletBinding()]
 param(
     [string]$ConfigFile = "config.toml",
     [switch]$WithLocalWorker,
@@ -7,10 +9,29 @@ param(
     [string]$WorkerDevice = "auto",
     [string]$LoadModel = "",
     [string]$ModelId = "",
-    [int]$ModelLayers = 0
+    [int]$ModelLayers = 0,
+    [Parameter(ValueFromRemainingArguments=$true)]
+    [string[]]$RemainingArgs
 )
 
 $ErrorActionPreference = "Stop"
+
+# Handle Unix-style arguments (--with-local-worker, --load-model, etc.)
+# PowerShell doesn't natively support double-dash or hyphenated params
+$i = 0
+while ($i -lt $RemainingArgs.Count) {
+    $arg = $RemainingArgs[$i]
+    switch -Regex ($arg) {
+        '^-{1,2}with-local-worker$' { $WithLocalWorker = $true }
+        '^-{1,2}worker-node-id$' { $i++; $WorkerNodeId = $RemainingArgs[$i] }
+        '^-{1,2}worker-device$' { $i++; $WorkerDevice = $RemainingArgs[$i] }
+        '^-{1,2}load-model$' { $i++; $LoadModel = $RemainingArgs[$i] }
+        '^-{1,2}model-id$' { $i++; $ModelId = $RemainingArgs[$i] }
+        '^-{1,2}model-layers$' { $i++; $ModelLayers = [int]$RemainingArgs[$i] }
+    }
+    $i++
+}
+
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $ProjectRoot
 
@@ -83,26 +104,26 @@ Write-Host ""
 Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
 Write-Host ""
 
-# Build argument list
-$args = @()
+# Build argument list for the Go binary
+$binArgs = @()
 if ($ConfigFile) {
-    $args += "-config", $ConfigFile
+    $binArgs += "-config", $ConfigFile
 }
 if ($WithLocalWorker) {
-    $args += "-with-local-worker"
-    $args += "-worker-node-id", $WorkerNodeId
-    $args += "-worker-device", $WorkerDevice
+    $binArgs += "-with-local-worker"
+    $binArgs += "-worker-node-id", $WorkerNodeId
+    $binArgs += "-worker-device", $WorkerDevice
 }
 if ($LoadModel) {
-    $args += "-load-model", $LoadModel
+    $binArgs += "-load-model", $LoadModel
     if ($ModelId) {
-        $args += "-model-id", $ModelId
+        $binArgs += "-model-id", $ModelId
     }
-    $args += "-model-layers", $ModelLayers
+    $binArgs += "-model-layers", $ModelLayers
 }
 
-if ($args.Count -gt 0) {
-    & .\build\bin\hydra.exe @args
+if ($binArgs.Count -gt 0) {
+    & .\build\bin\hydra.exe @binArgs
 } else {
     & .\build\bin\hydra.exe
 }
