@@ -8,7 +8,7 @@ import gc
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoConfig, AutoTokenizer
 from huggingface_hub import snapshot_download
 import structlog
 
@@ -88,46 +88,24 @@ class PartialTransformer(nn.Module):
         return hidden_states, new_past_key_values
 
 
-def parse_dtype(dtype_str: str) -> Tuple[torch.dtype, Optional[BitsAndBytesConfig]]:
-    """Parse dtype string and return torch dtype and optional quantization config."""
-    if dtype_str == "float16":
-        return torch.float16, None
-    elif dtype_str == "bfloat16":
-        return torch.bfloat16, None
-    elif dtype_str == "float32":
-        return torch.float32, None
-    elif dtype_str == "int8":
-        bnb_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0,
-        )
-        return torch.float16, bnb_config  # Base dtype for non-quantized parts
-    elif dtype_str == "int4":
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        return torch.bfloat16, bnb_config
-    elif dtype_str == "fp8":
-        # FP8 via bitsandbytes or native PyTorch
-        try:
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_has_fp16_weight=True,
-            )
-            return torch.float16, bnb_config
-        except Exception:
-            log.warning("FP8 not fully supported, falling back to int8")
-            return parse_dtype("int8")
-    else:
-        log.warning(f"Unknown dtype {dtype_str}, defaulting to bfloat16")
-        return torch.bfloat16, None
+def parse_dtype(dtype_str: str) -> torch.dtype:
+    """Parse dtype string to torch dtype."""
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+        "int8": torch.float16,  # Base dtype, quantization handled separately
+        "int4": torch.bfloat16,
+        "fp8": torch.float16,
+    }.get(dtype_str, torch.bfloat16)
 
 
 class PartialModelLoader:
-    """Load only specific layers from a model for distributed inference."""
+    """Load only specific layers from a model for distributed inference.
+
+    Uses selective weight loading - only loads weights for assigned layers,
+    not the full model. This enables true distributed loading across GPUs.
+    """
 
     def __init__(
         self,
@@ -137,18 +115,16 @@ class PartialModelLoader:
     ):
         self.device = device
 
-        # Parse dtype string
         if isinstance(dtype, str):
-            self.dtype, self.quantization_config = parse_dtype(dtype)
+            self.dtype = parse_dtype(dtype)
             self.dtype_str = dtype
         else:
             self.dtype = dtype
-            self.quantization_config = None
             self.dtype_str = str(dtype).split(".")[-1]
 
         self.original_model_path = model_path
 
-        # Check if it's a local path or HuggingFace model ID
+        # Download or locate model
         local_path = Path(model_path)
         if local_path.exists():
             self.model_path = local_path
@@ -167,9 +143,14 @@ class PartialModelLoader:
                 log.error("Failed to download model", error=str(e))
                 raise
 
+        # Load config
         self.config = AutoConfig.from_pretrained(str(self.model_path), trust_remote_code=True)
         self.arch = self._detect_architecture()
         self.is_moe = self._is_moe_model()
+
+        # Build weight index
+        self.weight_files = self._find_weight_files()
+        self.weight_index = self._build_weight_index()
 
         log.info(
             "Initialized partial loader",
@@ -178,7 +159,7 @@ class PartialModelLoader:
             is_moe=self.is_moe,
             num_layers=self.config.num_hidden_layers,
             dtype=self.dtype_str,
-            quantized=self.quantization_config is not None,
+            weight_files=len(self.weight_files),
         )
 
     def _detect_architecture(self) -> str:
@@ -198,7 +179,7 @@ class PartialModelLoader:
         elif "phi" in model_type:
             return "phi3"
         else:
-            log.warning(f"Unknown model type {model_type}, defaulting to auto")
+            log.warning(f"Unknown model type {model_type}, will use auto-detection")
             return "auto"
 
     def _is_moe_model(self) -> bool:
@@ -213,6 +194,56 @@ class PartialModelLoader:
             return True
         return False
 
+    def _find_weight_files(self) -> List[Path]:
+        """Find all safetensors files."""
+        if self.model_path.is_file():
+            return [self.model_path]
+
+        files = list(self.model_path.glob("*.safetensors"))
+        if not files:
+            raise FileNotFoundError(f"No safetensors files in {self.model_path}")
+
+        return sorted(files)
+
+    def _build_weight_index(self) -> Dict[str, Path]:
+        """Build index of weight name -> file path."""
+        index_path = self.model_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            return {
+                name: self.model_path / filename
+                for name, filename in index["weight_map"].items()
+            }
+
+        # Build index by scanning files
+        index = {}
+        for file_path in self.weight_files:
+            with safe_open(file_path, framework="pt") as f:
+                for name in f.keys():
+                    index[name] = file_path
+
+        return index
+
+    def _get_layer_prefix(self) -> str:
+        """Get the weight name prefix for layers based on architecture."""
+        # Most models use model.layers.X
+        return "model.layers."
+
+    def _load_tensor(self, name: str) -> Optional[torch.Tensor]:
+        """Load a single tensor by name."""
+        if name not in self.weight_index:
+            return None
+
+        file_path = self.weight_index[name]
+        with safe_open(file_path, framework="pt", device="cpu") as f:
+            return f.get_tensor(name).to(self.dtype)
+
+    def _get_layer_weight_names(self, layer_idx: int) -> List[str]:
+        """Get all weight names for a specific layer."""
+        prefix = f"{self._get_layer_prefix()}{layer_idx}."
+        return [name for name in self.weight_index.keys() if name.startswith(prefix)]
+
     def load_partial_model(
         self,
         layer_start: int,
@@ -220,39 +251,21 @@ class PartialModelLoader:
         include_embedding: bool = False,
         include_lm_head: bool = False,
     ) -> Tuple[PartialTransformer, AutoTokenizer]:
-        """Load a partial model with only specified layers."""
+        """Load a partial model with only specified layers.
+
+        Uses selective loading - only loads weights for the assigned layers,
+        not the full model. This enables distributed loading across multiple GPUs.
+        """
         log.info(
-            "Loading partial model",
+            "Loading partial model (selective)",
             layers=f"{layer_start}-{layer_end}",
             embedding=include_embedding,
             lm_head=include_lm_head,
             dtype=self.dtype_str,
         )
 
-        # Build loading kwargs
-        load_kwargs = {
-            "pretrained_model_name_or_path": str(self.model_path),
-            "device_map": "auto",  # Let transformers handle device placement
-            "low_cpu_mem_usage": True,
-            "trust_remote_code": True,
-        }
-
-        # Add quantization or dtype
-        if self.quantization_config:
-            load_kwargs["quantization_config"] = self.quantization_config
-            log.info("Loading with quantization", config=str(self.quantization_config))
-        else:
-            load_kwargs["torch_dtype"] = self.dtype
-
-        log.info("Loading model via transformers...")
-
-        try:
-            full_model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
-        except Exception as e:
-            log.error("Failed to load model", error=str(e))
-            raise
-
-        log.info("Model loaded, extracting layers...")
+        # Import the correct model class
+        model_class = self._get_model_class()
 
         # Create partial model structure
         partial = PartialTransformer(
@@ -265,64 +278,209 @@ class PartialModelLoader:
             device=self.device,
         )
 
-        # Get the model's internal structure
-        if hasattr(full_model, "model") and hasattr(full_model.model, "layers"):
-            inner_model = full_model.model
-            layers = inner_model.layers
-            embed_tokens = inner_model.embed_tokens
-            norm = inner_model.norm
-        elif hasattr(full_model, "transformer") and hasattr(full_model.transformer, "h"):
-            inner_model = full_model.transformer
-            layers = inner_model.h
-            embed_tokens = inner_model.wte
-            norm = inner_model.ln_f
-        else:
-            raise ValueError(f"Unknown model structure for {self.arch}")
-
-        # Copy embedding if needed
+        # Load embedding if needed
         if include_embedding:
-            partial.embed_tokens = embed_tokens
-            log.info("Loaded embedding layer")
+            embed_weight = self._load_tensor("model.embed_tokens.weight")
+            if embed_weight is not None:
+                partial.embed_tokens = nn.Embedding(
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                partial.embed_tokens.weight.data.copy_(embed_weight.to(self.device))
+                del embed_weight
+                log.info("Loaded embedding layer")
 
-        # Copy only the layers we need
-        for idx in range(layer_start, layer_end):
-            layer = layers[idx]
+        # Load transformer layers selectively
+        for layer_idx in range(layer_start, layer_end):
+            layer = self._create_and_load_layer(layer_idx, model_class)
             partial.layers.append(layer)
-            log.info(f"Loaded layer {idx}")
+            log.info(f"Loaded layer {layer_idx}")
+
+            # Clear CUDA cache periodically
+            if torch.cuda.is_available() and (layer_idx - layer_start) % 4 == 0:
+                torch.cuda.empty_cache()
 
         log.info(f"Loaded {len(partial.layers)} transformer layers")
 
-        # Copy norm and lm_head if needed
+        # Load norm and lm_head if needed
         if include_lm_head:
-            partial.norm = norm
-            partial.lm_head = full_model.lm_head
+            norm_weight = self._load_tensor("model.norm.weight")
+            if norm_weight is not None:
+                partial.norm = self._create_rms_norm()
+                partial.norm.weight.data.copy_(norm_weight.to(self.device))
+                partial.norm = partial.norm.to(self.device)
+                del norm_weight
+
+            lm_head_weight = self._load_tensor("lm_head.weight")
+            if lm_head_weight is not None:
+                partial.lm_head = nn.Linear(
+                    self.config.hidden_size,
+                    self.config.vocab_size,
+                    bias=False,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                partial.lm_head.weight.data.copy_(lm_head_weight.to(self.device))
+                del lm_head_weight
+
             log.info("Loaded norm and lm_head")
 
-        # Clear references to free memory for unused layers
-        # Note: With device_map="auto", layers are already on the right device
-        del full_model
+        # Cleanup
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        log.info("Cleaned up unused model parts")
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
 
         return partial, tokenizer
 
+    def _get_model_class(self):
+        """Get the appropriate model/layer class for this architecture."""
+        model_type = getattr(self.config, "model_type", "").lower()
+
+        # Return config so we can create layers with it
+        return self.config
+
+    def _create_rms_norm(self):
+        """Create RMSNorm layer."""
+        try:
+            from transformers.models.llama.modeling_llama import LlamaRMSNorm
+            return LlamaRMSNorm(
+                self.config.hidden_size,
+                eps=getattr(self.config, "rms_norm_eps", 1e-5)
+            )
+        except ImportError:
+            # Fallback to manual implementation
+            return RMSNorm(self.config.hidden_size, getattr(self.config, "rms_norm_eps", 1e-5))
+
+    def _create_and_load_layer(self, layer_idx: int, model_class) -> nn.Module:
+        """Create a layer and load its weights."""
+        model_type = getattr(self.config, "model_type", "").lower()
+
+        # Get all weights for this layer
+        weight_names = self._get_layer_weight_names(layer_idx)
+        weights = {}
+        for name in weight_names:
+            short_name = name.replace(f"{self._get_layer_prefix()}{layer_idx}.", "")
+            tensor = self._load_tensor(name)
+            if tensor is not None:
+                weights[short_name] = tensor
+
+        # Create the appropriate layer based on model type
+        if "qwen" in model_type:
+            layer = self._create_qwen_layer(layer_idx, weights)
+        elif "llama" in model_type:
+            layer = self._create_llama_layer(layer_idx, weights)
+        elif "mistral" in model_type or "mixtral" in model_type:
+            layer = self._create_mistral_layer(layer_idx, weights)
+        else:
+            # Generic fallback - try to auto-detect from weight names
+            layer = self._create_generic_layer(layer_idx, weights)
+
+        return layer.to(self.device)
+
+    def _create_qwen_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Create a Qwen/Qwen2 layer."""
+        model_type = getattr(self.config, "model_type", "").lower()
+
+        if self.is_moe or "moe" in model_type or "qwen3" in model_type:
+            # Qwen2 MoE / Qwen3 MoE
+            try:
+                from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeDecoderLayer
+                layer = Qwen2MoeDecoderLayer(self.config, layer_idx)
+            except ImportError:
+                try:
+                    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer
+                    layer = Qwen3MoeDecoderLayer(self.config, layer_idx)
+                except ImportError:
+                    log.warning("Qwen MoE layer not available, using generic")
+                    return self._create_generic_layer(layer_idx, weights)
+        else:
+            # Dense Qwen2
+            try:
+                from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+                layer = Qwen2DecoderLayer(self.config, layer_idx)
+            except ImportError:
+                from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                layer = LlamaDecoderLayer(self.config, layer_idx)
+
+        self._load_weights_into_layer(layer, weights)
+        return layer
+
+    def _create_llama_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Create a Llama layer."""
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+        layer = LlamaDecoderLayer(self.config, layer_idx)
+        self._load_weights_into_layer(layer, weights)
+        return layer
+
+    def _create_mistral_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Create a Mistral/Mixtral layer."""
+        if self.is_moe:
+            try:
+                from transformers.models.mixtral.modeling_mixtral import MixtralDecoderLayer
+                layer = MixtralDecoderLayer(self.config, layer_idx)
+            except ImportError:
+                return self._create_generic_layer(layer_idx, weights)
+        else:
+            try:
+                from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+                layer = MistralDecoderLayer(self.config, layer_idx)
+            except ImportError:
+                from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+                layer = LlamaDecoderLayer(self.config, layer_idx)
+
+        self._load_weights_into_layer(layer, weights)
+        return layer
+
+    def _create_generic_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Create a generic layer using Llama as fallback."""
+        from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaConfig
+
+        # Create a LlamaConfig from the model config
+        llama_config = LlamaConfig(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=getattr(self.config, "intermediate_size", self.config.hidden_size * 4),
+            num_attention_heads=self.config.num_attention_heads,
+            num_key_value_heads=getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            rms_norm_eps=getattr(self.config, "rms_norm_eps", 1e-5),
+            rope_theta=getattr(self.config, "rope_theta", 10000.0),
+            max_position_embeddings=getattr(self.config, "max_position_embeddings", 4096),
+        )
+
+        layer = LlamaDecoderLayer(llama_config, layer_idx)
+        self._load_weights_into_layer(layer, weights)
+        return layer
+
+    def _load_weights_into_layer(self, layer: nn.Module, weights: Dict[str, torch.Tensor]):
+        """Load weights into a layer, handling name mismatches."""
+        state_dict = layer.state_dict()
+        loaded = 0
+        missing = []
+
+        for weight_name, weight_tensor in weights.items():
+            # Try direct match
+            if weight_name in state_dict:
+                if state_dict[weight_name].shape == weight_tensor.shape:
+                    state_dict[weight_name].copy_(weight_tensor)
+                    loaded += 1
+                else:
+                    log.warning(f"Shape mismatch for {weight_name}: "
+                              f"expected {state_dict[weight_name].shape}, got {weight_tensor.shape}")
+            else:
+                missing.append(weight_name)
+
+        layer.load_state_dict(state_dict, strict=False)
+
+        if missing and len(missing) < 10:  # Only log if not too many
+            log.debug(f"Layer weights not matched: {missing[:5]}...")
+
     def estimate_memory(self, layer_start: int, layer_end: int) -> int:
         """Estimate GPU memory needed for layers in bytes."""
-        # Determine bytes per parameter based on quantization
-        if self.dtype_str == "int4":
-            bytes_per_param = 0.5
-        elif self.dtype_str in ("int8", "fp8"):
-            bytes_per_param = 1
-        elif self.dtype in (torch.float16, torch.bfloat16):
-            bytes_per_param = 2
-        else:
-            bytes_per_param = 4
+        bytes_per_param = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
 
         hidden = self.config.hidden_size
         intermediate = getattr(self.config, "intermediate_size", hidden * 4)
@@ -340,3 +498,17 @@ class PartialModelLoader:
         num_layers = layer_end - layer_start
 
         return int(num_layers * params_per_layer * bytes_per_param)
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states
