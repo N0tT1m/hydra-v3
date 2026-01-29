@@ -11,7 +11,11 @@ dependencies = [
     "torch>=2.2.0",
     "safetensors>=0.4.0",
     "tokenizers>=0.15.0",
-    "transformers>=4.36.0",
+    "transformers>=4.51.0",
+
+    # Quantization
+    "bitsandbytes>=0.42.0",
+    "accelerate>=0.25.0",
 
     # Communication
     "pyzmq>=25.0.0",
@@ -22,6 +26,7 @@ dependencies = [
     "psutil>=5.9.0",
     "structlog>=23.0.0",
     "click>=8.1.0",
+    "huggingface_hub>=0.20.0",
 ]
 
 [project.optional-dependencies]

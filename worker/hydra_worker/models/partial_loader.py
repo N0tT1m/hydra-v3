@@ -1,13 +1,14 @@
 """Partial model loading - load only specific layers for distributed inference."""
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import json
 import os
+import gc
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 from huggingface_hub import snapshot_download
 import structlog
 
@@ -15,11 +16,7 @@ log = structlog.get_logger()
 
 
 class PartialTransformer(nn.Module):
-    """A transformer that only contains a subset of layers.
-
-    This module wraps layers [layer_start, layer_end) from a full model,
-    plus optionally the embedding layer and lm_head.
-    """
+    """A transformer that only contains a subset of layers."""
 
     def __init__(
         self,
@@ -43,7 +40,6 @@ class PartialTransformer(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_layers = layer_end - layer_start
 
-        # These will be populated by load_weights
         self.embed_tokens: Optional[nn.Embedding] = None
         self.layers: nn.ModuleList = nn.ModuleList()
         self.norm: Optional[nn.Module] = None
@@ -57,38 +53,21 @@ class PartialTransformer(nn.Module):
         past_key_values: Optional[List] = None,
         use_cache: bool = True,
     ) -> Tuple[torch.Tensor, Optional[List]]:
-        """Forward pass through partial layers.
-
-        Args:
-            hidden_states: Input embeddings or hidden states from previous node
-                          Shape: [batch, seq_len, hidden_size] or [batch, seq_len] for tokens
-            position_ids: Position IDs for RoPE
-            attention_mask: Attention mask
-            past_key_values: KV cache from previous forward passes
-            use_cache: Whether to return updated KV cache
-
-        Returns:
-            hidden_states: Output hidden states (or logits if has_lm_head)
-            past_key_values: Updated KV cache
-        """
-        # If we have embedding layer and input is token IDs
+        """Forward pass through partial layers."""
         if self.has_embedding and hidden_states.dtype in (torch.long, torch.int):
             hidden_states = self.embed_tokens(hidden_states)
 
-        # Ensure correct dtype
-        hidden_states = hidden_states.to(self.dtype)
+        if self.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            hidden_states = hidden_states.to(self.dtype)
 
-        # Initialize past_key_values if needed
         if past_key_values is None and use_cache:
             past_key_values = [None] * self.num_layers
 
         new_past_key_values = [] if use_cache else None
 
-        # Forward through our layers
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values else None
 
-            # Standard transformer layer forward
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -102,7 +81,6 @@ class PartialTransformer(nn.Module):
             if use_cache:
                 new_past_key_values.append(layer_outputs[1])
 
-        # Apply final norm and lm_head if this is the last node
         if self.has_lm_head:
             hidden_states = self.norm(hidden_states)
             hidden_states = self.lm_head(hidden_states)
@@ -110,20 +88,64 @@ class PartialTransformer(nn.Module):
         return hidden_states, new_past_key_values
 
 
-class PartialModelLoader:
-    """Load only specific layers from a model for distributed inference.
+def parse_dtype(dtype_str: str) -> Tuple[torch.dtype, Optional[BitsAndBytesConfig]]:
+    """Parse dtype string and return torch dtype and optional quantization config."""
+    if dtype_str == "float16":
+        return torch.float16, None
+    elif dtype_str == "bfloat16":
+        return torch.bfloat16, None
+    elif dtype_str == "float32":
+        return torch.float32, None
+    elif dtype_str == "int8":
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0,
+        )
+        return torch.float16, bnb_config  # Base dtype for non-quantized parts
+    elif dtype_str == "int4":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+        return torch.bfloat16, bnb_config
+    elif dtype_str == "fp8":
+        # FP8 via bitsandbytes or native PyTorch
+        try:
+            bnb_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_has_fp16_weight=True,
+            )
+            return torch.float16, bnb_config
+        except Exception:
+            log.warning("FP8 not fully supported, falling back to int8")
+            return parse_dtype("int8")
+    else:
+        log.warning(f"Unknown dtype {dtype_str}, defaulting to bfloat16")
+        return torch.bfloat16, None
 
-    Uses transformers native classes for proper architecture support.
-    """
+
+class PartialModelLoader:
+    """Load only specific layers from a model for distributed inference."""
 
     def __init__(
         self,
         model_path: str,
         device: torch.device = torch.device("cuda"),
-        dtype: torch.dtype = torch.float16,
+        dtype: Union[str, torch.dtype] = "bfloat16",
     ):
         self.device = device
-        self.dtype = dtype
+
+        # Parse dtype string
+        if isinstance(dtype, str):
+            self.dtype, self.quantization_config = parse_dtype(dtype)
+            self.dtype_str = dtype
+        else:
+            self.dtype = dtype
+            self.quantization_config = None
+            self.dtype_str = str(dtype).split(".")[-1]
+
         self.original_model_path = model_path
 
         # Check if it's a local path or HuggingFace model ID
@@ -131,7 +153,6 @@ class PartialModelLoader:
         if local_path.exists():
             self.model_path = local_path
         else:
-            # Download from HuggingFace
             log.info("Downloading model from HuggingFace", model=model_path)
             cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
             try:
@@ -146,7 +167,6 @@ class PartialModelLoader:
                 log.error("Failed to download model", error=str(e))
                 raise
 
-        # Load config
         self.config = AutoConfig.from_pretrained(str(self.model_path), trust_remote_code=True)
         self.arch = self._detect_architecture()
         self.is_moe = self._is_moe_model()
@@ -157,6 +177,8 @@ class PartialModelLoader:
             arch=self.arch,
             is_moe=self.is_moe,
             num_layers=self.config.num_hidden_layers,
+            dtype=self.dtype_str,
+            quantized=self.quantization_config is not None,
         )
 
     def _detect_architecture(self) -> str:
@@ -165,9 +187,9 @@ class PartialModelLoader:
 
         if "llama" in model_type:
             return "llama"
-        elif "mistral" in model_type:
+        elif "mistral" in model_type and "moe" not in model_type:
             return "mistral"
-        elif "mixtral" in model_type:
+        elif "mixtral" in model_type or ("mistral" in model_type and "moe" in model_type):
             return "mixtral"
         elif "qwen2_moe" in model_type or "qwen3" in model_type:
             return "qwen2_moe"
@@ -176,12 +198,11 @@ class PartialModelLoader:
         elif "phi" in model_type:
             return "phi3"
         else:
-            log.warning(f"Unknown model type {model_type}, defaulting to llama")
-            return "llama"
+            log.warning(f"Unknown model type {model_type}, defaulting to auto")
+            return "auto"
 
     def _is_moe_model(self) -> bool:
         """Check if model is Mixture of Experts."""
-        # Check various config attributes that indicate MoE
         if hasattr(self.config, "num_experts"):
             return self.config.num_experts > 1
         if hasattr(self.config, "num_local_experts"):
@@ -199,38 +220,39 @@ class PartialModelLoader:
         include_embedding: bool = False,
         include_lm_head: bool = False,
     ) -> Tuple[PartialTransformer, AutoTokenizer]:
-        """Load a partial model with only specified layers.
-
-        Uses transformers' native model loading for proper architecture support.
-
-        Args:
-            layer_start: First layer index (inclusive)
-            layer_end: Last layer index (exclusive)
-            include_embedding: Whether to include embedding layer
-            include_lm_head: Whether to include final norm and lm_head
-
-        Returns:
-            Tuple of (partial model, tokenizer)
-        """
+        """Load a partial model with only specified layers."""
         log.info(
             "Loading partial model",
             layers=f"{layer_start}-{layer_end}",
             embedding=include_embedding,
             lm_head=include_lm_head,
+            dtype=self.dtype_str,
         )
 
-        # Load full model with low memory usage
-        log.info("Loading model via transformers (this may take a moment)...")
+        # Build loading kwargs
+        load_kwargs = {
+            "pretrained_model_name_or_path": str(self.model_path),
+            "device_map": "auto",  # Let transformers handle device placement
+            "low_cpu_mem_usage": True,
+            "trust_remote_code": True,
+        }
 
-        full_model = AutoModelForCausalLM.from_pretrained(
-            str(self.model_path),
-            torch_dtype=self.dtype,
-            device_map="cpu",  # Load to CPU first
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-        )
+        # Add quantization or dtype
+        if self.quantization_config:
+            load_kwargs["quantization_config"] = self.quantization_config
+            log.info("Loading with quantization", config=str(self.quantization_config))
+        else:
+            load_kwargs["torch_dtype"] = self.dtype
 
-        log.info("Full model loaded to CPU, extracting layers...")
+        log.info("Loading model via transformers...")
+
+        try:
+            full_model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+        except Exception as e:
+            log.error("Failed to load model", error=str(e))
+            raise
+
+        log.info("Model loaded, extracting layers...")
 
         # Create partial model structure
         partial = PartialTransformer(
@@ -244,15 +266,12 @@ class PartialModelLoader:
         )
 
         # Get the model's internal structure
-        # Most models use model.model.layers or model.transformer.layers
         if hasattr(full_model, "model") and hasattr(full_model.model, "layers"):
-            # Llama, Mistral, Qwen style
             inner_model = full_model.model
             layers = inner_model.layers
             embed_tokens = inner_model.embed_tokens
             norm = inner_model.norm
         elif hasattr(full_model, "transformer") and hasattr(full_model.transformer, "h"):
-            # GPT style
             inner_model = full_model.transformer
             layers = inner_model.h
             embed_tokens = inner_model.wte
@@ -262,12 +281,12 @@ class PartialModelLoader:
 
         # Copy embedding if needed
         if include_embedding:
-            partial.embed_tokens = embed_tokens.to(self.device)
+            partial.embed_tokens = embed_tokens
             log.info("Loaded embedding layer")
 
         # Copy only the layers we need
         for idx in range(layer_start, layer_end):
-            layer = layers[idx].to(self.device)
+            layer = layers[idx]
             partial.layers.append(layer)
             log.info(f"Loaded layer {idx}")
 
@@ -275,20 +294,18 @@ class PartialModelLoader:
 
         # Copy norm and lm_head if needed
         if include_lm_head:
-            partial.norm = norm.to(self.device)
-            partial.lm_head = full_model.lm_head.to(self.device)
+            partial.norm = norm
+            partial.lm_head = full_model.lm_head
             log.info("Loaded norm and lm_head")
 
-        # Free the full model from memory
+        # Clear references to free memory for unused layers
+        # Note: With device_map="auto", layers are already on the right device
         del full_model
-        del layers
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        import gc
-        gc.collect()
-
-        log.info("Cleaned up full model from memory")
+        log.info("Cleaned up unused model parts")
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
@@ -297,27 +314,29 @@ class PartialModelLoader:
 
     def estimate_memory(self, layer_start: int, layer_end: int) -> int:
         """Estimate GPU memory needed for layers in bytes."""
-        bytes_per_param = 2 if self.dtype == torch.float16 else 4
+        # Determine bytes per parameter based on quantization
+        if self.dtype_str == "int4":
+            bytes_per_param = 0.5
+        elif self.dtype_str in ("int8", "fp8"):
+            bytes_per_param = 1
+        elif self.dtype in (torch.float16, torch.bfloat16):
+            bytes_per_param = 2
+        else:
+            bytes_per_param = 4
 
-        # Per-layer params (approximate)
         hidden = self.config.hidden_size
         intermediate = getattr(self.config, "intermediate_size", hidden * 4)
 
-        # Check for MoE
         if self.is_moe:
             num_experts = getattr(self.config, "num_experts", getattr(self.config, "num_local_experts", 8))
-            # MoE has multiple expert MLPs
             mlp_params = num_experts * 3 * hidden * intermediate
         else:
-            # Dense: gate, up, down projections (for SwiGLU)
             mlp_params = 3 * hidden * intermediate
 
-        # Attention: Q, K, V, O
         attn_params = 4 * hidden * hidden
-        # Norms
         norm_params = 2 * hidden
 
         params_per_layer = attn_params + mlp_params + norm_params
         num_layers = layer_end - layer_start
 
-        return num_layers * params_per_layer * bytes_per_param
+        return int(num_layers * params_per_layer * bytes_per_param)

@@ -12,7 +12,8 @@ param(
     [string]$Device = "auto",
 
     [Alias("dtype")]
-    [string]$Dtype = "float16",
+    [ValidateSet("float16", "bfloat16", "float32", "int8", "int4", "fp8")]
+    [string]$Dtype = "bfloat16",
 
     [Alias("p", "pipeline-port")]
     [int]$PipelinePort = 6000

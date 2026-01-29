@@ -60,9 +60,9 @@ def cli(verbose: bool):
 )
 @click.option(
     "--dtype",
-    default="float16",
-    type=click.Choice(["float16", "bfloat16", "float32"]),
-    help="Data type for model weights (default: float16)",
+    default="bfloat16",
+    type=click.Choice(["float16", "bfloat16", "float32", "int8", "int4", "fp8"]),
+    help="Data type for model weights (default: bfloat16). Use int8/int4 for quantization.",
 )
 @click.option(
     "--pipeline-port",

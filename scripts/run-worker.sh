@@ -11,7 +11,7 @@ cd "$PROJECT_ROOT/worker"
 NODE_ID=""
 COORDINATOR="tcp://localhost:5555"
 DEVICE="auto"
-DTYPE="float16"
+DTYPE="bfloat16"
 PIPELINE_PORT="6000"
 
 # Parse arguments
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --node-id, -n       Unique worker ID (required)"
             echo "  --coordinator, -c   Coordinator address (default: tcp://localhost:5555)"
             echo "  --device, -d        Device to use: auto, cuda:0, cuda:1, mps, cpu (default: auto)"
-            echo "  --dtype             Data type: float16, bfloat16, float32 (default: float16)"
+            echo "  --dtype             Data type: float16, bfloat16, float32, int8, int4, fp8 (default: bfloat16)"
             echo "  --pipeline-port, -p Pipeline port (default: 6000)"
             echo ""
             echo "Examples:"

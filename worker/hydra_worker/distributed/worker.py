@@ -67,12 +67,9 @@ class DistributedWorker:
             return torch.device(f"{info.device_type}:{info.device_index}" if info.device_type != "cpu" else "cpu")
         return torch.device(self.config.device)
 
-    def _get_dtype(self) -> torch.dtype:
-        return {
-            "float16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "float32": torch.float32,
-        }.get(self.config.dtype, torch.float16)
+    def _get_dtype(self) -> str:
+        """Return dtype string - loader handles conversion and quantization."""
+        return self.config.dtype
 
     async def start(self):
         """Start the worker and connect to coordinator."""
