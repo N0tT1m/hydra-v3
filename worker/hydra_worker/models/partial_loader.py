@@ -467,11 +467,13 @@ class PartialModelLoader:
             for name, child in list(module.named_children()):
                 full_name = f"{prefix}.{name}" if prefix else name
 
-                # Skip MoE experts quantization for now - causes hangs due to
-                # expensive dequantization of all 128 experts on every forward pass
-                # TODO: Implement selective expert dequantization
+                # Check for MoE experts module (has gate_up_proj and down_proj as 3D tensors)
                 if self._is_moe_experts_module(child):
-                    log.debug(f"Skipping MoE experts quantization: {full_name}")
+                    success = self._quantize_moe_experts(child)
+                    if success:
+                        replaced_moe += 1
+                    else:
+                        failed += 1
                     continue
 
                 if isinstance(child, nn.Linear):
@@ -603,17 +605,19 @@ class PartialModelLoader:
         return quantized, scales.to(torch.float16).squeeze()
 
     def _wrap_moe_experts_forward(self, experts_module: nn.Module):
-        """Wrap MoE experts to dequantize weights during forward pass."""
+        """Wrap MoE experts to dequantize weights during forward pass.
+
+        Only dequantizes the selected experts (typically 2-8 out of 128),
+        not all experts, to avoid memory explosion.
+        """
         # Store original forward
         if not hasattr(experts_module, '_orig_forward'):
             experts_module._orig_forward = experts_module.forward
 
-        def dequantized_forward(hidden_states, selected_experts=None, routing_weights=None):
-            """Forward with on-the-fly dequantization."""
+        def dequantized_forward(hidden_states, selected_experts, routing_weights):
+            """Forward with selective on-the-fly dequantization."""
             if not hasattr(experts_module, '_quantized') or not experts_module._quantized:
-                if selected_experts is not None and routing_weights is not None:
-                    return experts_module._orig_forward(hidden_states, selected_experts, routing_weights)
-                return experts_module._orig_forward(hidden_states)
+                return experts_module._orig_forward(hidden_states, selected_experts, routing_weights)
 
             # Get quantized weights
             gate_up_q = experts_module.gate_up_proj_q
@@ -621,25 +625,56 @@ class PartialModelLoader:
             gate_up_scale = experts_module.gate_up_scale
             down_scale = experts_module.down_scale
 
-            # Dequantize all weights
-            gate_up_w = gate_up_q.to(hidden_states.dtype) * gate_up_scale.to(hidden_states.dtype)
-            down_w = down_q.to(hidden_states.dtype) * down_scale.to(hidden_states.dtype)
+            # Get unique selected experts to minimize dequantization
+            unique_experts = selected_experts.unique()
 
-            # Temporarily restore full weights for original forward
-            experts_module.gate_up_proj = nn.Parameter(gate_up_w, requires_grad=False)
-            experts_module.down_proj = nn.Parameter(down_w, requires_grad=False)
+            # Process each token through its selected experts
+            # hidden_states: (batch * seq_len, hidden_size) after reshaping
+            # selected_experts: (batch * seq_len, num_experts_per_tok)
+            # routing_weights: (batch * seq_len, num_experts_per_tok)
 
-            try:
-                if selected_experts is not None and routing_weights is not None:
-                    result = experts_module._orig_forward(hidden_states, selected_experts, routing_weights)
-                else:
-                    result = experts_module._orig_forward(hidden_states)
-            finally:
-                # Restore dummy params to free memory
-                experts_module.gate_up_proj = nn.Parameter(torch.empty(0, device=hidden_states.device), requires_grad=False)
-                experts_module.down_proj = nn.Parameter(torch.empty(0, device=hidden_states.device), requires_grad=False)
+            batch_size = hidden_states.shape[0]
+            hidden_size = hidden_states.shape[1]
+            num_experts_per_tok = selected_experts.shape[1]
 
-            return result
+            # Get intermediate size from gate_up weights (it's 2x because gate and up are concatenated)
+            intermediate_size = gate_up_q.shape[1] // 2
+
+            # Output accumulator
+            final_hidden_states = torch.zeros_like(hidden_states)
+
+            # Process each unique expert
+            for expert_idx in unique_experts:
+                expert_idx = expert_idx.item()
+
+                # Find which tokens use this expert and their positions
+                expert_mask = (selected_experts == expert_idx)  # (batch, num_experts_per_tok)
+
+                # Get the routing weights for this expert
+                expert_weights = routing_weights.masked_fill(~expert_mask, 0.0)  # Zero out non-selected
+                expert_weights_sum = expert_weights.sum(dim=1, keepdim=True)  # Sum across expert slots
+
+                # Skip if no tokens use this expert
+                if expert_weights_sum.sum() == 0:
+                    continue
+
+                # Dequantize only this expert's weights
+                gate_up_w = gate_up_q[expert_idx].to(hidden_states.dtype) * gate_up_scale[expert_idx].to(hidden_states.dtype)
+                down_w = down_q[expert_idx].to(hidden_states.dtype) * down_scale[expert_idx].to(hidden_states.dtype)
+
+                # Forward through expert MLP: x -> gate_up -> split -> silu(gate) * up -> down
+                intermediate = torch.nn.functional.linear(hidden_states, gate_up_w)
+                gate, up = intermediate.chunk(2, dim=-1)
+                intermediate = torch.nn.functional.silu(gate) * up
+                expert_out = torch.nn.functional.linear(intermediate, down_w)
+
+                # Weight by routing weights and accumulate
+                final_hidden_states += expert_out * expert_weights_sum
+
+                # Free intermediate tensors
+                del gate_up_w, down_w, intermediate, gate, up, expert_out
+
+            return final_hidden_states
 
         experts_module.forward = dequantized_forward
 
