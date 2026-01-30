@@ -107,6 +107,9 @@ class PartialTransformer(nn.Module):
 
         if self.has_lm_head:
             hidden_states = self.norm(hidden_states)
+            # Ensure dtype matches lm_head weights (may differ after int8 layers)
+            if self.lm_head.weight.dtype != hidden_states.dtype:
+                hidden_states = hidden_states.to(self.lm_head.weight.dtype)
             hidden_states = self.lm_head(hidden_states)
 
         return hidden_states, new_past_key_values
