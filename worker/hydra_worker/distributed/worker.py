@@ -302,8 +302,17 @@ class DistributedWorker:
         # First node processes token IDs, others process hidden states
         if self.position == PipelinePosition.FIRST:
             token_ids = msg.get("token_ids", [])
+            prompt = msg.get("prompt", "")
+
+            # If prompt provided, tokenize it
+            if prompt and self.tokenizer:
+                log.info("Tokenizing prompt", prompt_len=len(prompt))
+                inputs = self.tokenizer(prompt, return_tensors="pt")
+                token_ids = inputs["input_ids"][0].tolist()
+                log.info("Tokenized", token_count=len(token_ids))
+
             if not token_ids:
-                log.warning("No token_ids in forward request")
+                log.warning("No token_ids or prompt in forward request")
                 return
             input_ids = torch.tensor([token_ids], device=self.device)
             hidden_states = input_ids

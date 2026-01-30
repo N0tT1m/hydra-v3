@@ -141,7 +141,7 @@ func (m *InferenceManager) sendForwardRequest(
 		Int("token_count", len(tokenIDs)).
 		Msg("Sending forward request")
 
-	return m.broker.SendTo(nodeID, zmq.MsgTypeInference, msg)
+	return m.broker.SendTo(nodeID, zmq.MsgTypeForward, msg)
 }
 
 // HandleForwardResult handles a forward result from the last node
