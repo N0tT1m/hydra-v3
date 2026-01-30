@@ -91,10 +91,17 @@ class PartialTransformer(nn.Module):
                 position_embeddings=position_embeddings,
             )
 
-            hidden_states = layer_outputs[0]
-
-            if use_cache:
-                new_past_key_values.append(layer_outputs[1])
+            # Handle different return formats from layers
+            if isinstance(layer_outputs, tuple):
+                hidden_states = layer_outputs[0]
+                if use_cache and len(layer_outputs) > 1:
+                    new_past_key_values.append(layer_outputs[1])
+                elif use_cache:
+                    new_past_key_values.append(None)
+            else:
+                hidden_states = layer_outputs
+                if use_cache:
+                    new_past_key_values.append(None)
 
         if self.has_lm_head:
             hidden_states = self.norm(hidden_states)
