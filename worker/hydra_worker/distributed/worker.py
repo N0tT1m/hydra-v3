@@ -268,6 +268,10 @@ class DistributedWorker:
                     if broadcast:
                         await self._handle_broadcast(broadcast)
 
+                    # For non-FIRST workers, check for hidden states from upstream
+                    if self.model and self.position and self.position != PipelinePosition.FIRST:
+                        await self._check_upstream_hidden_states()
+
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -278,6 +282,90 @@ class DistributedWorker:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+    async def _check_upstream_hidden_states(self):
+        """Check for and process hidden states from upstream worker."""
+        if not self.zmq_handler.pull:
+            return
+
+        try:
+            result = await self.zmq_handler.receive_hidden_states(self.device, timeout=0.1)
+            if result is None:
+                return
+
+            hidden_states, sequence_id, past_len = result
+            log.info("Received hidden states from upstream",
+                     shape=hidden_states.shape, sequence_id=sequence_id)
+
+            # Process through our layers
+            await self._process_hidden_states(hidden_states, sequence_id, past_len)
+
+        except Exception as e:
+            log.error("Error receiving hidden states", error=str(e))
+
+    async def _process_hidden_states(self, hidden_states: torch.Tensor, sequence_id: str, past_len: int):
+        """Process hidden states through our layers and forward result."""
+        if not self.model:
+            log.warning("No model loaded")
+            return
+
+        # Get position IDs
+        seq_len = hidden_states.shape[1]
+        position_ids = torch.arange(past_len, past_len + seq_len, device=self.device).unsqueeze(0)
+
+        # Forward pass
+        with torch.no_grad():
+            try:
+                log.info("Starting model forward", input_shape=hidden_states.shape)
+                result = self.model(
+                    hidden_states,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+                if result is None:
+                    log.error("Model returned None")
+                    return
+                output, new_kv = result
+                log.info("Model forward complete", output_shape=output.shape)
+            except Exception as e:
+                log.error("Forward pass error", error=str(e), error_type=type(e).__name__)
+                import traceback
+                log.error("Traceback", tb=traceback.format_exc())
+                return
+
+        # Send result based on position
+        if self.position == PipelinePosition.LAST:
+            # Sample token and send result to coordinator
+            logits = output[0, -1, :].float()  # Get last position logits
+            token_id = int(torch.argmax(logits).item())
+
+            # Decode token if tokenizer available
+            token_text = ""
+            if self.tokenizer:
+                token_text = self.tokenizer.decode([token_id])
+
+            log.info("Sending result to coordinator", token_id=token_id, text=repr(token_text))
+
+            await self.zmq_handler.send({
+                "type": "forward_result",
+                "node_id": self.config.node_id,
+                "sequence_id": sequence_id,
+                "logits": logits.tolist(),
+                "token_id": token_id,
+                "text": token_text,
+                "finished": token_id == self.tokenizer.eos_token_id if self.tokenizer else False,
+                "finish_reason": "stop" if (self.tokenizer and token_id == self.tokenizer.eos_token_id) else None,
+            })
+            log.info("Result sent to coordinator")
+        else:
+            # Forward hidden states to next node
+            log.info("Sending hidden states to next node", shape=output.shape, sequence_id=sequence_id)
+            await self.zmq_handler.send_hidden_states(
+                output,
+                sequence_id=sequence_id,
+                position=past_len + seq_len,
+            )
+            log.info("Hidden states sent")
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats to coordinator."""
