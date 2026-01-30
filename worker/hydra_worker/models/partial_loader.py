@@ -467,13 +467,11 @@ class PartialModelLoader:
             for name, child in list(module.named_children()):
                 full_name = f"{prefix}.{name}" if prefix else name
 
-                # Check for MoE experts module (has gate_up_proj and down_proj as 3D tensors)
+                # Skip MoE experts quantization for now - causes hangs due to
+                # expensive dequantization of all 128 experts on every forward pass
+                # TODO: Implement selective expert dequantization
                 if self._is_moe_experts_module(child):
-                    success = self._quantize_moe_experts(child)
-                    if success:
-                        replaced_moe += 1
-                    else:
-                        failed += 1
+                    log.debug(f"Skipping MoE experts quantization: {full_name}")
                     continue
 
                 if isinstance(child, nn.Linear):
