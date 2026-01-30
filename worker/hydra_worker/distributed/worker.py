@@ -98,16 +98,46 @@ class DistributedWorker:
         """Register with coordinator."""
         device_info = self.memory_tracker.get_device_info()
 
+        # Get actual hostname/IP for other workers to connect to
+        host = self._get_host_address()
+
         await self.zmq_handler.send({
             "type": "register",
             "node_id": self.config.node_id,
-            "host": "localhost",  # TODO: Get actual host
+            "host": host,
             "pipeline_port": self.config.pipeline_port,
             "vram_gb": device_info.total_memory / (1024**3),
             "capabilities": ["cuda" if self.device.type == "cuda" else self.device.type],
         })
 
-        log.info("Registered with coordinator")
+        log.info("Registered with coordinator", host=host)
+
+    def _get_host_address(self) -> str:
+        """Get the host address that other workers can use to connect to us."""
+        import socket
+
+        # Try to get the IP address by connecting to a known address
+        # This works even without internet - just uses routing table
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            pass
+
+        # Fallback to hostname
+        try:
+            hostname = socket.gethostname()
+            ip = socket.gethostbyname(hostname)
+            if ip != "127.0.0.1":
+                return ip
+        except Exception:
+            pass
+
+        # Last resort
+        return "localhost"
 
     async def _wait_for_assignment(self):
         """Wait for layer assignment from coordinator."""
