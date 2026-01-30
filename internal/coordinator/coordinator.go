@@ -97,6 +97,9 @@ func (c *Coordinator) handleModelLoaded(msg *zmq.Message) {
 		return
 	}
 
+	// Clear loading state - node can now be health checked
+	c.registry.SetNodeLoading(loaded.NodeID, false)
+
 	log.Info().
 		Str("node_id", loaded.NodeID).
 		Int("layer_count", len(loaded.Layers)).

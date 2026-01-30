@@ -61,8 +61,8 @@ def cli(verbose: bool):
 @click.option(
     "--dtype",
     default="bfloat16",
-    type=click.Choice(["float16", "bfloat16", "float32", "int8", "int4", "fp8"]),
-    help="Data type for model weights (default: bfloat16). Use int8/int4 for quantization.",
+    type=click.Choice(["float16", "bfloat16", "float32", "int8", "int4", "fp8", "q8", "q4"]),
+    help="Data type for model weights (default: bfloat16). Use int8/int4/q8/q4 for quantization.",
 )
 @click.option(
     "--pipeline-port",
@@ -83,6 +83,10 @@ def start(
     Example:
         hydra-worker start --node-id worker-1 --coordinator tcp://192.168.1.100:5555
     """
+    # Normalize dtype aliases
+    dtype_map = {"q8": "int8", "q4": "int4"}
+    dtype = dtype_map.get(dtype, dtype)
+
     log = structlog.get_logger()
     log.info(
         "Starting worker",

@@ -7,6 +7,7 @@ param(
     [switch]$WithLocalWorker,
     [string]$WorkerNodeId = "local-worker",
     [string]$WorkerDevice = "auto",
+    [string]$WorkerDtype = "bfloat16",
     [string]$LoadModel = "",
     [string]$ModelId = "",
     [int]$ModelLayers = 0,
@@ -26,13 +27,14 @@ while ($i -lt $RemainingArgs.Count) {
         '^-{1,2}with-local-worker$' { $WithLocalWorker = $true; $matched = $true }
         '^-{1,2}worker-node-id$' { $i++; $WorkerNodeId = $RemainingArgs[$i]; $matched = $true }
         '^-{1,2}worker-device$' { $i++; $WorkerDevice = $RemainingArgs[$i]; $matched = $true }
+        '^-{1,2}worker-dtype$' { $i++; $WorkerDtype = $RemainingArgs[$i]; $matched = $true }
         '^-{1,2}load-model$' { $i++; $LoadModel = $RemainingArgs[$i]; $matched = $true }
         '^-{1,2}model-id$' { $i++; $ModelId = $RemainingArgs[$i]; $matched = $true }
         '^-{1,2}model-layers$' { $i++; $ModelLayers = [int]$RemainingArgs[$i]; $matched = $true }
     }
     # Warn about unrecognized flags (but not their values)
     if (-not $matched -and $arg -match '^-') {
-        Write-Host "WARNING: Unrecognized option '$arg' - did you mean --worker-device or --worker-node-id?" -ForegroundColor Yellow
+        Write-Host "WARNING: Unrecognized option '$arg' - did you mean --worker-device, --worker-dtype, or --worker-node-id?" -ForegroundColor Yellow
     }
     $i++
 }
@@ -96,7 +98,7 @@ Write-Host "  ZMQ Router: tcp://*:5555" -ForegroundColor Cyan
 Write-Host "  ZMQ Metrics: tcp://*:5556" -ForegroundColor Cyan
 Write-Host "  ZMQ Broadcast: tcp://*:5557" -ForegroundColor Cyan
 if ($WithLocalWorker) {
-    Write-Host "  Local Worker: $WorkerNodeId ($WorkerDevice)" -ForegroundColor Cyan
+    Write-Host "  Local Worker: $WorkerNodeId ($WorkerDevice, $WorkerDtype)" -ForegroundColor Cyan
 }
 if ($LoadModel) {
     if ($ModelLayers -eq 0) {
@@ -118,6 +120,7 @@ if ($WithLocalWorker) {
     $binArgs += "-with-local-worker"
     $binArgs += "-worker-node-id", $WorkerNodeId
     $binArgs += "-worker-device", $WorkerDevice
+    $binArgs += "-worker-dtype", $WorkerDtype
 }
 if ($LoadModel) {
     $binArgs += "-load-model", $LoadModel

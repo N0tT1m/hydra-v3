@@ -23,6 +23,7 @@ type Node struct {
 	RegisteredAt    time.Time
 	LastHeartbeat   time.Time
 	IsHealthy       bool
+	IsLoading       bool // True while loading model, skips health checks
 	ConsecutiveMiss int
 
 	// Metrics
@@ -149,6 +150,11 @@ func (r *Registry) CheckHealth(threshold int) []string {
 	unhealthy := make([]string, 0)
 
 	for _, node := range r.nodes {
+		// Skip health checks for nodes that are loading models
+		if node.IsLoading {
+			continue
+		}
+
 		if now.Sub(node.LastHeartbeat) > timeout {
 			node.ConsecutiveMiss++
 
@@ -160,6 +166,20 @@ func (r *Registry) CheckHealth(threshold int) []string {
 	}
 
 	return unhealthy
+}
+
+// SetNodeLoading sets the loading state for a node
+func (r *Registry) SetNodeLoading(nodeID string, loading bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if node, ok := r.nodes[nodeID]; ok {
+		node.IsLoading = loading
+		if loading {
+			// Reset health state when starting to load
+			node.ConsecutiveMiss = 0
+		}
+	}
 }
 
 // SetNodeHealth manually sets a node's health status

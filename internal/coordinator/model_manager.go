@@ -111,6 +111,9 @@ func (m *ModelManager) LoadModel(ctx context.Context, modelID, modelPath string,
 
 	// Send load commands to each worker
 	for i, assign := range distribution {
+		// Mark node as loading (skips health checks during model load)
+		m.registry.SetNodeLoading(assign.NodeID, true)
+
 		// Determine position
 		position := "MIDDLE"
 		if i == 0 {
@@ -139,6 +142,8 @@ func (m *ModelManager) LoadModel(ctx context.Context, modelID, modelPath string,
 
 		if err := m.broker.SendTo(assign.NodeID, zmq.MsgTypeLoadModel, loadCmd); err != nil {
 			log.Error().Err(err).Str("node", assign.NodeID).Msg("Failed to send load command")
+			// Clear loading state on failure
+			m.registry.SetNodeLoading(assign.NodeID, false)
 		}
 	}
 

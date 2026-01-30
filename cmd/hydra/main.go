@@ -26,6 +26,7 @@ func main() {
 	withLocalWorker := flag.Bool("with-local-worker", false, "Start a local Python worker")
 	workerNodeID := flag.String("worker-node-id", "local-worker", "Node ID for local worker")
 	workerDevice := flag.String("worker-device", "auto", "Device for local worker (auto, cuda:0, mps, cpu)")
+	workerDtype := flag.String("worker-dtype", "bfloat16", "Dtype for local worker (bfloat16, float16, int8, int4)")
 	loadModel := flag.String("load-model", "", "HuggingFace model to load on startup (e.g., meta-llama/Llama-2-7b-hf)")
 	modelID := flag.String("model-id", "", "ID to assign to the loaded model (default: derived from model path)")
 	modelLayers := flag.Int("model-layers", 0, "Number of layers in the model (0 = auto-detect from HuggingFace)")
@@ -82,6 +83,7 @@ func main() {
 	startWorker := *withLocalWorker || cfg.LocalWorker.Enabled
 	workerNode := *workerNodeID
 	workerDev := *workerDevice
+	workerDt := *workerDtype
 
 	// Use config values if CLI flags are defaults
 	if !*withLocalWorker && cfg.LocalWorker.Enabled {
@@ -90,6 +92,9 @@ func main() {
 		}
 		if cfg.LocalWorker.Device != "" {
 			workerDev = cfg.LocalWorker.Device
+		}
+		if cfg.LocalWorker.Dtype != "" {
+			workerDt = cfg.LocalWorker.Dtype
 		}
 	}
 
@@ -100,7 +105,7 @@ func main() {
 				Str("node_id", workerNode).
 				Msg("Invalid worker node ID (looks like a flag). Check your --worker-node-id argument.")
 		}
-		workerCmd = startLocalWorker(workerNode, workerDev, cfg.ZMQ.RouterAddr)
+		workerCmd = startLocalWorker(workerNode, workerDev, workerDt, cfg.ZMQ.RouterAddr)
 	}
 
 	// Auto-load model if specified
@@ -188,10 +193,11 @@ func main() {
 }
 
 // startLocalWorker spawns a local Python worker process
-func startLocalWorker(nodeID, device, coordinatorAddr string) *exec.Cmd {
+func startLocalWorker(nodeID, device, dtype, coordinatorAddr string) *exec.Cmd {
 	log.Info().
 		Str("node_id", nodeID).
 		Str("device", device).
+		Str("dtype", dtype).
 		Msg("Starting local worker")
 
 	// Find the worker directory
@@ -232,6 +238,7 @@ func startLocalWorker(nodeID, device, coordinatorAddr string) *exec.Cmd {
 		"--node-id", nodeID,
 		"--coordinator", workerCoordAddr,
 		"--device", device,
+		"--dtype", dtype,
 	)
 
 	cmd.Dir = workerDir

@@ -21,6 +21,7 @@ type LocalWorkerConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	NodeID  string `mapstructure:"node_id"`
 	Device  string `mapstructure:"device"`
+	Dtype   string `mapstructure:"dtype"`
 }
 
 // ServerConfig holds HTTP server configuration
@@ -90,6 +91,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("local_worker.enabled", false)
 	v.SetDefault("local_worker.node_id", "local-worker")
 	v.SetDefault("local_worker.device", "auto")
+	v.SetDefault("local_worker.dtype", "bfloat16")
 
 	// Read config file
 	v.SetConfigFile(path)
