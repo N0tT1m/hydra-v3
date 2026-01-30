@@ -761,6 +761,7 @@ class PartialModelLoader:
             "sliding_window": None,
             "max_window_layers": 0,
             "_attn_implementation": "eager",  # Required for transformers attention dispatch
+            "_experts_implementation": "eager",  # Required for transformers MoE dispatch
         }
         for attr, default in defaults.items():
             if not hasattr(self.config, attr) or getattr(self.config, attr) is None:
