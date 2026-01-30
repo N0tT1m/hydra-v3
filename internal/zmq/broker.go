@@ -267,20 +267,27 @@ func (b *Broker) SendTo(nodeID string, msgType MessageType, payload interface{})
 
 // Broadcast sends a message to all workers via PUB socket
 func (b *Broker) Broadcast(msgType MessageType, payload interface{}) error {
+	// Convert payload to map and add type field (same as SendTo)
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
-	msg := Message{
-		Type:    msgType,
-		Payload: payloadBytes,
+	// Create flattened message with string type
+	var msg map[string]interface{}
+	if err := json.Unmarshal(payloadBytes, &msg); err != nil {
+		msg = make(map[string]interface{})
 	}
+
+	// Add type as string for Python compatibility
+	msg["type"] = string(msgType)
 
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
+
+	log.Debug().Str("type", string(msgType)).Msg("Broadcasting message")
 
 	_, err = b.pubSocket.SendBytes(data, 0)
 	return err
