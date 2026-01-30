@@ -769,9 +769,10 @@ class PartialModelLoader:
             "use_sliding_window": False,
             "sliding_window": None,
             "max_window_layers": 0,
+            "_attn_implementation": "eager",  # Required for transformers attention dispatch
         }
         for attr, default in defaults.items():
-            if not hasattr(self.config, attr):
+            if not hasattr(self.config, attr) or getattr(self.config, attr) is None:
                 setattr(self.config, attr, default)
 
     def _create_llama_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
