@@ -22,13 +22,14 @@ type InferenceManager struct {
 
 // InferenceRequest represents an inference request
 type InferenceRequest struct {
-	ID          string
-	SequenceID  string
-	Prompt      string
-	Config      GenerationConfig
-	CreatedAt   time.Time
-	FirstNodeID string
-	LastNodeID  string
+	ID              string
+	SequenceID      string
+	Prompt          string
+	Config          GenerationConfig
+	CreatedAt       time.Time
+	FirstNodeID     string
+	LastNodeID      string
+	tokensGenerated int
 }
 
 // GenerationConfig holds generation parameters
@@ -172,14 +173,30 @@ func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
 		return
 	}
 
+	// Track token count
+	if req.tokensGenerated == 0 {
+		req.tokensGenerated = 0
+	}
+	req.tokensGenerated++
+
+	// Check if we should stop
+	finished := result.Finished
+	finishReason := result.FinishReason
+
+	if !finished && req.tokensGenerated >= req.Config.MaxNewTokens {
+		finished = true
+		finishReason = "length"
+		log.Info().Int("tokens", req.tokensGenerated).Msg("Max tokens reached")
+	}
+
 	// Send result to channel
 	inferenceResult := &InferenceResult{
 		SequenceID:   result.SequenceID,
 		Logits:       result.Logits,
 		TokenID:      result.TokenID,
 		Text:         result.Text,
-		Finished:     result.Finished,
-		FinishReason: result.FinishReason,
+		Finished:     finished,
+		FinishReason: finishReason,
 	}
 
 	select {
@@ -189,7 +206,26 @@ func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
 	}
 
 	// If finished, cleanup
-	if result.Finished {
+	if finished {
+		m.cleanupRequest(result.SequenceID)
+		return
+	}
+
+	// Continue generation with the new token
+	log.Info().
+		Int("token_id", result.TokenID).
+		Int("tokens_generated", req.tokensGenerated).
+		Msg("Continuing generation")
+
+	if err := m.ContinueGeneration(result.SequenceID, result.TokenID, req.tokensGenerated); err != nil {
+		log.Error().Err(err).Msg("Failed to continue generation")
+		// Mark as finished on error
+		inferenceResult.Finished = true
+		inferenceResult.FinishReason = "error"
+		select {
+		case resultCh <- inferenceResult:
+		default:
+		}
 		m.cleanupRequest(result.SequenceID)
 	}
 }
