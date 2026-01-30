@@ -22,14 +22,13 @@ type InferenceManager struct {
 
 // InferenceRequest represents an inference request
 type InferenceRequest struct {
-	ID           string
-	SequenceID   string
-	Prompt       string
-	TokenIDs     []int
-	Config       GenerationConfig
-	CreatedAt    time.Time
-	FirstNodeID  string
-	LastNodeID   string
+	ID          string
+	SequenceID  string
+	Prompt      string
+	Config      GenerationConfig
+	CreatedAt   time.Time
+	FirstNodeID string
+	LastNodeID  string
 }
 
 // GenerationConfig holds generation parameters
@@ -67,7 +66,7 @@ func NewInferenceManager(broker *zmq.Broker, modelManager *ModelManager) *Infere
 func (m *InferenceManager) StartGeneration(
 	ctx context.Context,
 	sequenceID string,
-	tokenIDs []int,
+	prompt string,
 	config GenerationConfig,
 ) (chan *InferenceResult, error) {
 	model := m.modelManager.GetActiveModel()
@@ -84,6 +83,13 @@ func (m *InferenceManager) StartGeneration(
 	firstNodeID := distribution[0].NodeID
 	lastNodeID := distribution[len(distribution)-1].NodeID
 
+	log.Info().
+		Str("sequence_id", sequenceID).
+		Str("first_node", firstNodeID).
+		Str("last_node", lastNodeID).
+		Int("prompt_len", len(prompt)).
+		Msg("Starting generation")
+
 	// Create result channel
 	resultCh := make(chan *InferenceResult, 100)
 
@@ -91,7 +97,7 @@ func (m *InferenceManager) StartGeneration(
 	m.pendingRequests[sequenceID] = &InferenceRequest{
 		ID:          sequenceID,
 		SequenceID:  sequenceID,
-		TokenIDs:    tokenIDs,
+		Prompt:      prompt,
 		Config:      config,
 		CreatedAt:   time.Now(),
 		FirstNodeID: firstNodeID,
@@ -100,8 +106,8 @@ func (m *InferenceManager) StartGeneration(
 	m.resultChannels[sequenceID] = resultCh
 	m.mu.Unlock()
 
-	// Send initial forward request to first node
-	err := m.sendForwardRequest(firstNodeID, sequenceID, tokenIDs, 0)
+	// Send initial forward request to first node with prompt
+	err := m.sendForwardRequest(firstNodeID, sequenceID, prompt, nil, 0, config)
 	if err != nil {
 		m.cleanupRequest(sequenceID)
 		return nil, err
@@ -114,15 +120,26 @@ func (m *InferenceManager) StartGeneration(
 func (m *InferenceManager) sendForwardRequest(
 	nodeID string,
 	sequenceID string,
+	prompt string,
 	tokenIDs []int,
 	pastLen int,
+	config GenerationConfig,
 ) error {
 	msg := ForwardRequest{
 		Type:       "forward",
 		SequenceID: sequenceID,
+		Prompt:     prompt,
 		TokenIDs:   tokenIDs,
 		PastLen:    pastLen,
+		Config:     config,
 	}
+
+	log.Info().
+		Str("node_id", nodeID).
+		Str("sequence_id", sequenceID).
+		Int("prompt_len", len(prompt)).
+		Int("token_count", len(tokenIDs)).
+		Msg("Sending forward request")
 
 	return m.broker.SendTo(nodeID, zmq.MsgTypeInference, msg)
 }
@@ -181,7 +198,7 @@ func (m *InferenceManager) ContinueGeneration(
 		return fmt.Errorf("no pending request for sequence %s", sequenceID)
 	}
 
-	return m.sendForwardRequest(req.FirstNodeID, sequenceID, []int{tokenID}, pastLen)
+	return m.sendForwardRequest(req.FirstNodeID, sequenceID, "", []int{tokenID}, pastLen, req.Config)
 }
 
 // cleanupRequest removes a request and closes its channel
@@ -212,8 +229,10 @@ func (m *InferenceManager) StopGeneration(sequenceID string) {
 type ForwardRequest struct {
 	Type       string `json:"type"`
 	SequenceID string `json:"sequence_id"`
-	TokenIDs   []int  `json:"token_ids"`
+	Prompt     string `json:"prompt,omitempty"`
+	TokenIDs   []int  `json:"token_ids,omitempty"`
 	PastLen    int    `json:"past_len"`
+	Config     GenerationConfig `json:"config,omitempty"`
 }
 
 type ForwardResult struct {

@@ -84,7 +84,7 @@ func completeChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
 
-	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, nil, config)
+	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, prompt, config)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, types.ErrorResponse{
 			Error: types.ErrorDetail{
@@ -154,7 +154,6 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 
 	// Build prompt from messages
 	prompt := buildPrompt(req.Messages)
-	_ = prompt // Will be used when we add tokenization
 
 	// Get generation config
 	config := coordinator.GenerationConfig{
@@ -172,7 +171,7 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 120*time.Second)
 	defer cancel()
 
-	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, nil, config)
+	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, prompt, config)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, types.ErrorResponse{
 			Error: types.ErrorDetail{
