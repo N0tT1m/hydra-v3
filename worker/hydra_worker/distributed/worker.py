@@ -331,11 +331,21 @@ class DistributedWorker:
 
         # Forward pass
         with torch.no_grad():
-            output, new_kv = self.model(
-                hidden_states,
-                position_ids=position_ids,
-                use_cache=True,
-            )
+            try:
+                result = self.model(
+                    hidden_states,
+                    position_ids=position_ids,
+                    use_cache=True,
+                )
+                if result is None:
+                    log.error("Model returned None")
+                    return
+                output, new_kv = result
+            except Exception as e:
+                log.error("Forward pass error", error=str(e), error_type=type(e).__name__)
+                import traceback
+                log.error("Traceback", tb=traceback.format_exc())
+                return
 
         # Send result
         if self.position == PipelinePosition.LAST:
