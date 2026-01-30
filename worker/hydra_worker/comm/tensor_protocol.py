@@ -253,6 +253,20 @@ class TensorSerializer:
 
             # Reconstruct tensor
             torch_dtype, np_dtype = DTYPE_REVERSE[dtype_code]
+
+            # Calculate expected size
+            element_size = np.dtype(np_dtype).itemsize
+            expected_elements = 1
+            for s in shape:
+                expected_elements *= s
+            expected_size = expected_elements * element_size
+
+            if len(tensor_bytes) != expected_size:
+                raise ValueError(
+                    f"Tensor data size mismatch: got {len(tensor_bytes)} bytes, "
+                    f"expected {expected_size} bytes for shape {shape} dtype {np_dtype}"
+                )
+
             arr = np.frombuffer(tensor_bytes, dtype=np_dtype).reshape(shape)
             tensor = torch.from_numpy(arr.copy())
 

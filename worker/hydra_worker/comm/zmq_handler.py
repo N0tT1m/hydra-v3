@@ -207,7 +207,9 @@ class ZMQHandler:
 
         try:
             data = await self.pull.recv()
-            tensor, meta = TensorSerializer.deserialize(data, device)
+            tensors, meta = TensorSerializer.deserialize(data, device)
+            # deserialize returns a list, get first tensor
+            tensor = tensors[0] if tensors else None
             return tensor, meta["sequence_id"], meta["position"]
         except zmq.Again:
             return None
