@@ -278,8 +278,9 @@ class TensorSerializer:
             tensors.append(tensor.to(device))
 
         # Parse metadata if present
+        # data_size is at offset 28 in each descriptor (after BBBB=4, 4I=16, Q=8)
         expected_data_end = header_total + sum(
-            struct.unpack_from(">Q", data, HEADER_SIZE + i * TENSOR_DESC_SIZE + 24)[0]
+            struct.unpack_from(">Q", data, HEADER_SIZE + i * TENSOR_DESC_SIZE + 28)[0]
             for i in range(tensor_count)
         )
 

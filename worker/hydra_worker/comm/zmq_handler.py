@@ -210,7 +210,9 @@ class ZMQHandler:
             tensors, meta = TensorSerializer.deserialize(data, device)
             # deserialize returns a list, get first tensor
             tensor = tensors[0] if tensors else None
-            return tensor, meta["sequence_id"], meta["position"]
+            sequence_id = meta.get("sequence_id", "")
+            position = meta.get("position", 0)
+            return tensor, sequence_id, position
         except zmq.Again:
             return None
 
