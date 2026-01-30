@@ -114,7 +114,8 @@ class DistributedWorker:
         log.info("Waiting for layer assignment...")
 
         while True:
-            msg = await self.zmq_handler.receive(timeout=5.0)
+            # Check direct messages
+            msg = await self.zmq_handler.receive(timeout=1.0)
             if msg and msg.get("type") == "register_ack":
                 log.info("Received assignment", msg=msg)
                 break
@@ -122,10 +123,18 @@ class DistributedWorker:
                 await self._handle_topology(msg)
                 break
 
+            # Also check broadcasts
+            broadcast = await self.zmq_handler.check_broadcast()
+            if broadcast and broadcast.get("type") == "topology":
+                await self._handle_topology(broadcast)
+                break
+
         log.info("Assignment received")
 
     async def _handle_topology(self, msg: Dict[str, Any]):
         """Handle topology assignment from coordinator."""
+        log.info("Received topology message", nodes=len(msg.get("nodes", [])))
+
         # Find our assignment
         for node_info in msg.get("nodes", []):
             if node_info["node_id"] == self.config.node_id:
@@ -137,8 +146,17 @@ class DistributedWorker:
                 upstream = node_info.get("upstream")
                 downstream_port = node_info.get("downstream_port")
 
+                log.info(
+                    "Found our topology assignment",
+                    node_id=self.config.node_id,
+                    upstream=upstream,
+                    downstream_port=downstream_port,
+                )
+
                 if upstream or downstream_port:
-                    self.zmq_handler.setup_pipeline(upstream, f"tcp://*:{downstream_port}" if downstream_port else None)
+                    next_addr = f"tcp://*:{downstream_port}" if downstream_port else None
+                    log.info("Setting up pipeline", upstream=upstream, next_addr=next_addr)
+                    self.zmq_handler.setup_pipeline(upstream, next_addr)
 
                 log.info(
                     "Topology configured",
@@ -147,7 +165,9 @@ class DistributedWorker:
                     upstream=upstream,
                     downstream=downstream_port,
                 )
-                break
+                return
+
+        log.warning("Node not found in topology", node_id=self.config.node_id, nodes=[n.get("node_id") for n in msg.get("nodes", [])])
 
     def _load_model_sync(self, model_path: str):
         """Synchronous model loading (runs in thread to not block heartbeats)."""
@@ -287,7 +307,7 @@ class DistributedWorker:
         """Handle broadcast message."""
         msg_type = msg.get("type")
 
-        if msg_type == "topology_change":
+        if msg_type == "topology" or msg_type == "topology_change":
             await self._handle_topology(msg)
 
     async def _handle_forward(self, msg: Dict[str, Any]):
