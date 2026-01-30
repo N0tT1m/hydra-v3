@@ -73,6 +73,8 @@ func (c *Coordinator) Run(ctx context.Context) {
 
 // handleMessage routes incoming messages to appropriate handlers
 func (c *Coordinator) handleMessage(msg *zmq.Message) {
+	log.Debug().Str("type", string(msg.Type)).Str("node_id", msg.NodeID).Msg("Received message")
+
 	switch msg.Type {
 	case zmq.MsgTypeRegister:
 		c.handleRegister(msg)

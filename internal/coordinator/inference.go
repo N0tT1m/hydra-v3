@@ -146,11 +146,21 @@ func (m *InferenceManager) sendForwardRequest(
 
 // HandleForwardResult handles a forward result from the last node
 func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
+	log.Info().Msg("Received forward_result message")
+
 	var result ForwardResult
 	if err := msg.Decode(&result); err != nil {
 		log.Error().Err(err).Msg("Failed to decode forward result")
 		return
 	}
+
+	log.Info().
+		Str("sequence_id", result.SequenceID).
+		Str("node_id", result.NodeID).
+		Int("token_id", result.TokenID).
+		Str("text", result.Text).
+		Bool("finished", result.Finished).
+		Msg("Forward result decoded")
 
 	m.mu.RLock()
 	resultCh, ok := m.resultChannels[result.SequenceID]
