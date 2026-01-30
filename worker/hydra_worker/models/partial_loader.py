@@ -52,6 +52,7 @@ class PartialTransformer(nn.Module):
         self.layers: nn.ModuleList = nn.ModuleList()
         self.norm: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Linear] = None
+        self.rotary_emb: Optional[nn.Module] = None
 
     def forward(
         self,
@@ -73,6 +74,11 @@ class PartialTransformer(nn.Module):
 
         new_past_key_values = [] if use_cache else None
 
+        # Compute position embeddings if we have a rotary_emb module
+        position_embeddings = None
+        if self.rotary_emb is not None and position_ids is not None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values else None
 
@@ -82,6 +88,7 @@ class PartialTransformer(nn.Module):
                 position_ids=position_ids,
                 past_key_value=layer_past,
                 use_cache=use_cache,
+                position_embeddings=position_embeddings,
             )
 
             hidden_states = layer_outputs[0]
@@ -312,6 +319,21 @@ class PartialModelLoader:
                 partial.embed_tokens.weight.data.copy_(embed_weight.to(self.device))
                 del embed_weight
                 log.info("Loaded embedding layer")
+
+        # Create rotary embedding module (needed for position embeddings)
+        # ALL workers need this, not just the first one
+        model_type = getattr(self.config, "model_type", "").lower()
+        try:
+            if "qwen3" in model_type or (self.is_moe and "qwen" in model_type):
+                from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding
+                partial.rotary_emb = Qwen3MoeRotaryEmbedding(self.config).to(self.device)
+                log.info("Created rotary embedding (Qwen3MoE)")
+            else:
+                from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+                partial.rotary_emb = Qwen2RotaryEmbedding(self.config).to(self.device)
+                log.info("Created rotary embedding (Qwen2)")
+        except ImportError as e:
+            log.warning(f"Could not create rotary embedding: {e}")
 
         # Load transformer layers selectively
         for layer_idx in range(layer_start, layer_end):
