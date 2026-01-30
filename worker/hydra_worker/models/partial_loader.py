@@ -82,6 +82,8 @@ class PartialTransformer(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_past = past_key_values[i] if past_key_values else None
 
+            log.debug(f"Forward layer {i + self.layer_start}", shape=hidden_states.shape)
+
             layer_outputs = layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -627,6 +629,7 @@ class PartialModelLoader:
 
             # Get unique selected experts to minimize dequantization
             unique_experts = selected_experts.unique()
+            log.debug(f"MoE forward: {len(unique_experts)} unique experts, input shape {hidden_states.shape}")
 
             # Process each token through its selected experts
             # hidden_states: (batch * seq_len, hidden_size) after reshaping
