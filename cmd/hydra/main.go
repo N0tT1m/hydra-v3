@@ -94,6 +94,12 @@ func main() {
 	}
 
 	if startWorker {
+		// Validate node ID doesn't look like a flag (common CLI parsing mistake)
+		if strings.HasPrefix(workerNode, "-") {
+			log.Fatal().
+				Str("node_id", workerNode).
+				Msg("Invalid worker node ID (looks like a flag). Check your --worker-node-id argument.")
+		}
 		workerCmd = startLocalWorker(workerNode, workerDev, cfg.ZMQ.RouterAddr)
 	}
 
@@ -109,6 +115,23 @@ func main() {
 
 			// Wait for healthy workers with stabilization time
 			log.Info().Msg("Waiting for healthy workers before loading model...")
+
+			// If local worker is enabled, wait specifically for it to register
+			if startWorker {
+				log.Info().Str("node_id", workerNode).Msg("Waiting for local worker to register...")
+				localWorkerReady := false
+				for i := 0; i < 60; i++ { // Wait up to 60 seconds for local worker
+					time.Sleep(1 * time.Second)
+					if coord.GetRegistry().HasNode(workerNode) {
+						log.Info().Str("node_id", workerNode).Msg("Local worker registered")
+						localWorkerReady = true
+						break
+					}
+				}
+				if !localWorkerReady {
+					log.Warn().Str("node_id", workerNode).Msg("Local worker did not register within 60s, proceeding anyway")
+				}
+			}
 
 			// First, wait for at least one healthy worker
 			for i := 0; i < 30; i++ {

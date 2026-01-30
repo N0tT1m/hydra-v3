@@ -210,6 +210,14 @@ func (r *Registry) NodeCount() int {
 	return len(r.nodes)
 }
 
+// HasNode checks if a node with the given ID is registered
+func (r *Registry) HasNode(nodeID string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.nodes[nodeID]
+	return ok
+}
+
 // HealthyNodeCount returns the number of healthy nodes
 func (r *Registry) HealthyNodeCount() int {
 	r.mu.RLock()
