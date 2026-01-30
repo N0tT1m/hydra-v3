@@ -87,6 +87,20 @@ def _get_cuda_info(idx: int) -> DeviceInfo:
         )
         raise RuntimeError("CUDA not available - check PyTorch installation and NVIDIA drivers")
 
+    device_count = torch.cuda.device_count()
+    if idx >= device_count:
+        available = [f"cuda:{i}" for i in range(device_count)]
+        log.error(
+            "Invalid CUDA device index",
+            requested=f"cuda:{idx}",
+            device_count=device_count,
+            available_devices=available,
+        )
+        raise RuntimeError(
+            f"CUDA device cuda:{idx} not found. "
+            f"Available devices: {', '.join(available) if available else 'none'}"
+        )
+
     props = torch.cuda.get_device_properties(idx)
     total = props.total_memory
     free = total - torch.cuda.memory_allocated(idx)
