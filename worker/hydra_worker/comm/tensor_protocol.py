@@ -26,7 +26,8 @@ import msgpack
 MAGIC = 0x48594452  # "HYDR"
 VERSION = 1
 HEADER_SIZE = 40
-TENSOR_DESC_SIZE = 32
+# Tensor descriptor: BBBB (4) + 4I (16) + QQ (16) = 36 bytes
+TENSOR_DESC_SIZE = 36
 
 # Message types
 MSG_TYPE_HIDDEN_STATE = 0x0001
