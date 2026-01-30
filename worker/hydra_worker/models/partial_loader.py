@@ -599,16 +599,16 @@ class PartialModelLoader:
 
     def _wrap_moe_experts_forward(self, experts_module: nn.Module):
         """Wrap MoE experts to dequantize weights during forward pass."""
-        original_class = type(experts_module)
-
         # Store original forward
         if not hasattr(experts_module, '_orig_forward'):
             experts_module._orig_forward = experts_module.forward
 
-        def dequantized_forward(hidden_states, expert_idx=None):
+        def dequantized_forward(hidden_states, selected_experts=None, routing_weights=None):
             """Forward with on-the-fly dequantization."""
             if not hasattr(experts_module, '_quantized') or not experts_module._quantized:
-                return experts_module._orig_forward(hidden_states, expert_idx)
+                if selected_experts is not None and routing_weights is not None:
+                    return experts_module._orig_forward(hidden_states, selected_experts, routing_weights)
+                return experts_module._orig_forward(hidden_states)
 
             # Get quantized weights
             gate_up_q = experts_module.gate_up_proj_q
@@ -616,34 +616,25 @@ class PartialModelLoader:
             gate_up_scale = experts_module.gate_up_scale
             down_scale = experts_module.down_scale
 
-            # Dequantize for the selected expert(s)
-            if expert_idx is not None:
-                # Single expert
-                gate_up_w = gate_up_q[expert_idx].to(hidden_states.dtype) * gate_up_scale[expert_idx].to(hidden_states.dtype)
-                down_w = down_q[expert_idx].to(hidden_states.dtype) * down_scale[expert_idx].to(hidden_states.dtype)
+            # Dequantize all weights
+            gate_up_w = gate_up_q.to(hidden_states.dtype) * gate_up_scale.to(hidden_states.dtype)
+            down_w = down_q.to(hidden_states.dtype) * down_scale.to(hidden_states.dtype)
 
-                # Apply the MLP: gate_up -> split -> silu(gate) * up -> down
-                intermediate = torch.nn.functional.linear(hidden_states, gate_up_w)
-                gate, up = intermediate.chunk(2, dim=-1)
-                intermediate = torch.nn.functional.silu(gate) * up
-                return torch.nn.functional.linear(intermediate, down_w)
-            else:
-                # Batch processing - dequantize all
-                gate_up_w = gate_up_q.to(hidden_states.dtype) * gate_up_scale.to(hidden_states.dtype)
-                down_w = down_q.to(hidden_states.dtype) * down_scale.to(hidden_states.dtype)
+            # Temporarily restore full weights for original forward
+            experts_module.gate_up_proj = nn.Parameter(gate_up_w, requires_grad=False)
+            experts_module.down_proj = nn.Parameter(down_w, requires_grad=False)
 
-                # Temporarily restore full weights for original forward
-                experts_module.gate_up_proj = nn.Parameter(gate_up_w, requires_grad=False)
-                experts_module.down_proj = nn.Parameter(down_w, requires_grad=False)
-
-                try:
+            try:
+                if selected_experts is not None and routing_weights is not None:
+                    result = experts_module._orig_forward(hidden_states, selected_experts, routing_weights)
+                else:
                     result = experts_module._orig_forward(hidden_states)
-                finally:
-                    # Restore dummy params
-                    experts_module.gate_up_proj = nn.Parameter(torch.empty(0), requires_grad=False)
-                    experts_module.down_proj = nn.Parameter(torch.empty(0), requires_grad=False)
+            finally:
+                # Restore dummy params to free memory
+                experts_module.gate_up_proj = nn.Parameter(torch.empty(0, device=hidden_states.device), requires_grad=False)
+                experts_module.down_proj = nn.Parameter(torch.empty(0, device=hidden_states.device), requires_grad=False)
 
-                return result
+            return result
 
         experts_module.forward = dequantized_forward
 
