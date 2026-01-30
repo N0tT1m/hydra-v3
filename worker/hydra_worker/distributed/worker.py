@@ -359,9 +359,12 @@ class DistributedWorker:
             log.info("Result sent to coordinator")
         else:
             # Forward hidden states to next node
-            log.info("Sending hidden states to next node", shape=output.shape, sequence_id=sequence_id)
+            # Ensure consistent dtype (float16) for transmission to save bandwidth
+            output_to_send = output.to(torch.float16) if output.dtype != torch.float16 else output
+            log.info("Sending hidden states to next node", shape=output_to_send.shape,
+                     dtype=str(output_to_send.dtype), sequence_id=sequence_id)
             await self.zmq_handler.send_hidden_states(
-                output,
+                output_to_send,
                 sequence_id=sequence_id,
                 position=past_len + seq_len,
             )
@@ -512,9 +515,12 @@ class DistributedWorker:
             })
         else:
             # Forward hidden states to next node
-            log.info("Sending hidden states to next node", shape=output.shape, sequence_id=sequence_id)
+            # Ensure consistent dtype (float16) for transmission to save bandwidth
+            output_to_send = output.to(torch.float16) if output.dtype != torch.float16 else output
+            log.info("Sending hidden states to next node", shape=output_to_send.shape,
+                     dtype=str(output_to_send.dtype), sequence_id=sequence_id)
             await self.zmq_handler.send_hidden_states(
-                output,
+                output_to_send,
                 sequence_id=sequence_id,
                 position=past_len + seq_len,
             )
