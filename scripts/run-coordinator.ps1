@@ -21,13 +21,18 @@ $ErrorActionPreference = "Stop"
 $i = 0
 while ($i -lt $RemainingArgs.Count) {
     $arg = $RemainingArgs[$i]
+    $matched = $false
     switch -Regex ($arg) {
-        '^-{1,2}with-local-worker$' { $WithLocalWorker = $true }
-        '^-{1,2}worker-node-id$' { $i++; $WorkerNodeId = $RemainingArgs[$i] }
-        '^-{1,2}worker-device$' { $i++; $WorkerDevice = $RemainingArgs[$i] }
-        '^-{1,2}load-model$' { $i++; $LoadModel = $RemainingArgs[$i] }
-        '^-{1,2}model-id$' { $i++; $ModelId = $RemainingArgs[$i] }
-        '^-{1,2}model-layers$' { $i++; $ModelLayers = [int]$RemainingArgs[$i] }
+        '^-{1,2}with-local-worker$' { $WithLocalWorker = $true; $matched = $true }
+        '^-{1,2}worker-node-id$' { $i++; $WorkerNodeId = $RemainingArgs[$i]; $matched = $true }
+        '^-{1,2}worker-device$' { $i++; $WorkerDevice = $RemainingArgs[$i]; $matched = $true }
+        '^-{1,2}load-model$' { $i++; $LoadModel = $RemainingArgs[$i]; $matched = $true }
+        '^-{1,2}model-id$' { $i++; $ModelId = $RemainingArgs[$i]; $matched = $true }
+        '^-{1,2}model-layers$' { $i++; $ModelLayers = [int]$RemainingArgs[$i]; $matched = $true }
+    }
+    # Warn about unrecognized flags (but not their values)
+    if (-not $matched -and $arg -match '^-') {
+        Write-Host "WARNING: Unrecognized option '$arg' - did you mean --worker-device or --worker-node-id?" -ForegroundColor Yellow
     }
     $i++
 }
