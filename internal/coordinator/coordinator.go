@@ -231,14 +231,22 @@ func (c *Coordinator) GetInferenceManager() *InferenceManager {
 
 // GetLoadedModels returns currently loaded models
 func (c *Coordinator) GetLoadedModels() []*LoadedModel {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	models := make([]*LoadedModel, 0, len(c.loadedModels))
-	for _, m := range c.loadedModels {
-		models = append(models, m)
+	// Get models from ModelManager
+	activeModel := c.modelManager.GetActiveModel()
+	if activeModel == nil {
+		return []*LoadedModel{}
 	}
-	return models
+
+	return []*LoadedModel{
+		{
+			ID:          activeModel.ID,
+			Path:        activeModel.Path,
+			TotalLayers: activeModel.TotalLayers,
+			VocabSize:   activeModel.VocabSize,
+			HiddenSize:  activeModel.HiddenSize,
+			LoadedAt:    activeModel.LoadedAt,
+		},
+	}
 }
 
 // Message types for coordinator
