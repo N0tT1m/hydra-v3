@@ -337,24 +337,35 @@ class DistributedWorker:
         if self.position == PipelinePosition.LAST:
             # Sample token and send result to coordinator
             logits = output[0, -1, :].float()  # Get last position logits
-            token_id = int(torch.argmax(logits).item())
+
+            # Apply sampling (temperature, top_p, top_k)
+            token_id = self._sample_token(logits)
 
             # Decode token if tokenizer available
             token_text = ""
+            is_eos = False
             if self.tokenizer:
                 token_text = self.tokenizer.decode([token_id])
+                # Check for EOS tokens (Qwen uses multiple)
+                eos_tokens = {
+                    self.tokenizer.eos_token_id,
+                    self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+                    self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                }
+                eos_tokens.discard(None)  # Remove None if token doesn't exist
+                is_eos = token_id in eos_tokens
 
-            log.info("Sending result to coordinator", token_id=token_id, text=repr(token_text))
+            log.info("Sending result to coordinator", token_id=token_id, text=repr(token_text), is_eos=is_eos)
 
             await self.zmq_handler.send({
                 "type": "forward_result",
                 "node_id": self.config.node_id,
                 "sequence_id": sequence_id,
-                "logits": logits.tolist(),
+                "logits": [],  # Don't send full logits to save bandwidth
                 "token_id": token_id,
                 "text": token_text,
-                "finished": token_id == self.tokenizer.eos_token_id if self.tokenizer else False,
-                "finish_reason": "stop" if (self.tokenizer and token_id == self.tokenizer.eos_token_id) else None,
+                "finished": is_eos,
+                "finish_reason": "stop" if is_eos else None,
             })
             log.info("Result sent to coordinator")
         else:
@@ -495,23 +506,32 @@ class DistributedWorker:
             # Sample token and send result to coordinator
             logits = output[0, -1, :].float()  # Get last position logits
 
-            # Simple argmax for now (sampling is done in coordinator)
-            token_id = int(torch.argmax(logits).item())
+            # Apply sampling (temperature, top_p, top_k)
+            token_id = self._sample_token(logits)
 
             # Decode token if tokenizer available
             token_text = ""
+            is_eos = False
             if self.tokenizer:
                 token_text = self.tokenizer.decode([token_id])
+                # Check for EOS tokens (Qwen uses multiple)
+                eos_tokens = {
+                    self.tokenizer.eos_token_id,
+                    self.tokenizer.convert_tokens_to_ids("<|im_end|>"),
+                    self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
+                }
+                eos_tokens.discard(None)  # Remove None if token doesn't exist
+                is_eos = token_id in eos_tokens
 
             await self.zmq_handler.send({
                 "type": "forward_result",
                 "node_id": self.config.node_id,
                 "sequence_id": sequence_id,
-                "logits": logits.tolist(),
+                "logits": [],  # Don't send full logits to save bandwidth
                 "token_id": token_id,
                 "text": token_text,
-                "finished": token_id == self.tokenizer.eos_token_id if self.tokenizer else False,
-                "finish_reason": "stop" if (self.tokenizer and token_id == self.tokenizer.eos_token_id) else None,
+                "finished": is_eos,
+                "finish_reason": "stop" if is_eos else None,
             })
         else:
             # Forward hidden states to next node
@@ -565,6 +585,47 @@ class DistributedWorker:
             })
         except Exception as e:
             log.error("Failed to send heartbeat", error=str(e))
+
+    def _sample_token(
+        self,
+        logits: torch.Tensor,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        top_k: int = 50,
+    ) -> int:
+        """Sample a token from logits using temperature, top-p, and top-k."""
+        # Apply temperature
+        if temperature > 0:
+            logits = logits / temperature
+        else:
+            # Greedy decoding
+            return int(torch.argmax(logits).item())
+
+        # Apply top-k filtering
+        if top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits[indices_to_remove] = float('-inf')
+
+        # Apply top-p (nucleus) filtering
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+
+            # Remove tokens with cumulative probability above the threshold
+            sorted_indices_to_remove = cumulative_probs > top_p
+            # Shift the indices to the right to keep also the first token above the threshold
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = 0
+
+            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+            logits[indices_to_remove] = float('-inf')
+
+        # Sample from the filtered distribution
+        probs = torch.softmax(logits, dim=-1)
+        token_id = torch.multinomial(probs, num_samples=1).item()
+
+        return int(token_id)
 
     def stop(self):
         """Stop the worker."""

@@ -319,22 +319,36 @@ func stringPtr(s string) *string {
 	return &s
 }
 
-// buildPrompt constructs a prompt string from chat messages
+// buildPrompt constructs a prompt string from chat messages using ChatML format (Qwen3)
 func buildPrompt(messages []types.ChatMessage) string {
 	var prompt strings.Builder
+
+	// Check if there's a system message, if not add default
+	hasSystem := false
+	for _, msg := range messages {
+		if msg.Role == "system" {
+			hasSystem = true
+			break
+		}
+	}
+
+	if !hasSystem {
+		prompt.WriteString("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n")
+	}
 
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			prompt.WriteString(fmt.Sprintf("System: %s\n\n", msg.Content))
+			prompt.WriteString(fmt.Sprintf("<|im_start|>system\n%s<|im_end|>\n", msg.Content))
 		case "user":
-			prompt.WriteString(fmt.Sprintf("User: %s\n\n", msg.Content))
+			prompt.WriteString(fmt.Sprintf("<|im_start|>user\n%s<|im_end|>\n", msg.Content))
 		case "assistant":
-			prompt.WriteString(fmt.Sprintf("Assistant: %s\n\n", msg.Content))
+			prompt.WriteString(fmt.Sprintf("<|im_start|>assistant\n%s<|im_end|>\n", msg.Content))
 		}
 	}
 
-	prompt.WriteString("Assistant: ")
+	// Start assistant response
+	prompt.WriteString("<|im_start|>assistant\n")
 	return prompt.String()
 }
 
