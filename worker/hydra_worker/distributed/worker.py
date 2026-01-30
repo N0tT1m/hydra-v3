@@ -382,6 +382,7 @@ class DistributedWorker:
         # Forward pass
         with torch.no_grad():
             try:
+                log.info("Starting model forward", input_shape=hidden_states.shape)
                 result = self.model(
                     hidden_states,
                     position_ids=position_ids,
@@ -391,6 +392,7 @@ class DistributedWorker:
                     log.error("Model returned None")
                     return
                 output, new_kv = result
+                log.info("Model forward complete", output_shape=output.shape)
             except Exception as e:
                 log.error("Forward pass error", error=str(e), error_type=type(e).__name__)
                 import traceback
@@ -422,11 +424,13 @@ class DistributedWorker:
             })
         else:
             # Forward hidden states to next node
+            log.info("Sending hidden states to next node", shape=output.shape, sequence_id=sequence_id)
             await self.zmq_handler.send_hidden_states(
                 output,
                 sequence_id=sequence_id,
                 position=past_len + seq_len,
             )
+            log.info("Hidden states sent")
 
     async def _handle_generate(self, msg: Dict[str, Any]):
         """Handle generation request (first node only)."""
