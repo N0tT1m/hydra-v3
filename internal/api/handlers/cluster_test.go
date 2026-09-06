@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hydra-v3/internal/coordinator"
-	"github.com/hydra-v3/internal/testutil"
-	"github.com/hydra-v3/internal/zmq"
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
+	"github.com/N0tT1m/hydra-v3/internal/testutil"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 )
 
 // --- GET /api/cluster/status -----------------------------------------------

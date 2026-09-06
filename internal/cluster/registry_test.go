@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 )
 
 func testConfig() config.ClusterConfig {

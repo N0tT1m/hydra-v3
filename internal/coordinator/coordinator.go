@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hydra-v3/internal/cluster"
-	"github.com/hydra-v3/internal/config"
-	"github.com/hydra-v3/internal/zmq"
+	"github.com/N0tT1m/hydra-v3/internal/cluster"
+	"github.com/N0tT1m/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 	"github.com/rs/zerolog/log"
 )
 

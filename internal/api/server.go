@@ -7,11 +7,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/N0tT1m/hydra-v3/internal/api/handlers"
+	"github.com/N0tT1m/hydra-v3/internal/api/middleware"
+	"github.com/N0tT1m/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
 	"github.com/gin-gonic/gin"
-	"github.com/hydra-v3/internal/api/handlers"
-	"github.com/hydra-v3/internal/api/middleware"
-	"github.com/hydra-v3/internal/config"
-	"github.com/hydra-v3/internal/coordinator"
 )
 
 // Server is the HTTP API server

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )

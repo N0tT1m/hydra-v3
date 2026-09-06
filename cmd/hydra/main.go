@@ -14,10 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hydra-v3/internal/api"
-	"github.com/hydra-v3/internal/config"
-	"github.com/hydra-v3/internal/coordinator"
-	"github.com/hydra-v3/internal/zmq"
+	"github.com/N0tT1m/hydra-v3/internal/api"
+	"github.com/N0tT1m/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )

@@ -3,8 +3,8 @@ package handlers
 import (
 	"net/http"
 
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
 	"github.com/gin-gonic/gin"
-	"github.com/hydra-v3/internal/coordinator"
 )
 
 // Vision and image-generation surfaces are routed but not implemented.

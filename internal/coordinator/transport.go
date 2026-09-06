@@ -1,6 +1,6 @@
 package coordinator
 
-import "github.com/hydra-v3/internal/zmq"
+import "github.com/N0tT1m/hydra-v3/internal/zmq"
 
 // Sender is the outbound half of the worker transport: everything the model
 // and inference managers need in order to talk to workers.

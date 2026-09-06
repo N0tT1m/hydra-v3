@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/N0tT1m/hydra-v3/internal/api/types"
+	"github.com/N0tT1m/hydra-v3/internal/cluster"
+	"github.com/N0tT1m/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
+	"github.com/N0tT1m/hydra-v3/internal/testutil"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 	"github.com/gin-gonic/gin"
-	"github.com/hydra-v3/internal/api/types"
-	"github.com/hydra-v3/internal/cluster"
-	"github.com/hydra-v3/internal/config"
-	"github.com/hydra-v3/internal/coordinator"
-	"github.com/hydra-v3/internal/testutil"
-	"github.com/hydra-v3/internal/zmq"
 )
 
 func init() {

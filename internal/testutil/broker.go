@@ -11,7 +11,7 @@ import (
 	"encoding/json"
 	"sync"
 
-	"github.com/hydra-v3/internal/zmq"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 )
 
 // Frame is one message the coordinator handed to the transport.

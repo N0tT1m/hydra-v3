@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 	zmq "github.com/pebbe/zmq4"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/context"

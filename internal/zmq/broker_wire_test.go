@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 	zmq "github.com/pebbe/zmq4"
 )
 

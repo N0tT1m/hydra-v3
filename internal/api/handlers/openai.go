@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/N0tT1m/hydra-v3/internal/api/types"
+	"github.com/N0tT1m/hydra-v3/internal/coordinator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/hydra-v3/internal/api/types"
-	"github.com/hydra-v3/internal/coordinator"
 )
 
 // ChatCompletions handles POST /v1/chat/completions

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydra-v3/internal/config"
-	"github.com/hydra-v3/internal/testutil"
-	"github.com/hydra-v3/internal/zmq"
+	"github.com/N0tT1m/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/testutil"
+	"github.com/N0tT1m/hydra-v3/internal/zmq"
 )
 
 // testConfig returns a config with short timings so health transitions happen

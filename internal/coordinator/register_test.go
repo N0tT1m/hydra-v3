@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 )
 
 // validator returns a Coordinator with only the config slot populated —

@@ -1,4 +1,4 @@
-module github.com/hydra-v3
+module github.com/N0tT1m/hydra-v3
 
 go 1.22
 

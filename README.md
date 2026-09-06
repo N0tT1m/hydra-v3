@@ -104,7 +104,7 @@ The fastest way to get started is using the setup scripts:
 
 **macOS:**
 ```bash
-git clone https://github.com/your-org/hydra-v3.git
+git clone https://github.com/N0tT1m/hydra-v3.git
 cd hydra-v3
 ./scripts/setup-macos.sh
 ./scripts/quick-start.sh
@@ -112,7 +112,7 @@ cd hydra-v3
 
 **Linux:**
 ```bash
-git clone https://github.com/your-org/hydra-v3.git
+git clone https://github.com/N0tT1m/hydra-v3.git
 cd hydra-v3
 ./scripts/setup-linux.sh
 ./scripts/quick-start.sh
@@ -120,7 +120,7 @@ cd hydra-v3
 
 **Windows (PowerShell as Administrator):**
 ```powershell
-git clone https://github.com/your-org/hydra-v3.git
+git clone https://github.com/N0tT1m/hydra-v3.git
 cd hydra-v3
 .\scripts\setup-windows.ps1
 .\scripts\quick-start.ps1
@@ -147,7 +147,7 @@ These scripts will:
 #### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-org/hydra-v3.git
+git clone https://github.com/N0tT1m/hydra-v3.git
 cd hydra-v3
 ```
 

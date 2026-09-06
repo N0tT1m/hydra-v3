@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hydra-v3/internal/config"
+	"github.com/N0tT1m/hydra-v3/internal/config"
 )
 
 // Node represents a worker node in the cluster
