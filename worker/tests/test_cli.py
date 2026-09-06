@@ -241,3 +241,28 @@ def test_test_load_marks_the_final_slice_as_owning_the_lm_head(runner, monkeypat
     assert result.exit_code == 0, result.output
     assert FakeLoader.last.requested["include_embedding"] is False
     assert FakeLoader.last.requested["include_lm_head"] is True
+
+
+def test_host_defaults_to_empty_so_the_worker_resolves_it(runner, captured_worker):
+    result = runner.invoke(cli, ["start", "--node-id", "worker-1"])
+
+    assert result.exit_code == 0, result.output
+    # Empty means "resolve from the local hostname" in _get_host_address().
+    assert captured_worker["config"].host == ""
+
+
+def test_host_flag_sets_the_advertised_address(runner, captured_worker):
+    result = runner.invoke(
+        cli, ["start", "--node-id", "worker-1", "--host", "192.168.1.90"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured_worker["config"].host == "192.168.1.90"
+
+
+def test_host_can_come_from_the_environment(runner, captured_worker, monkeypatch):
+    monkeypatch.setenv("HYDRA_WORKER_HOST", "10.0.0.5")
+    result = runner.invoke(cli, ["start", "--node-id", "worker-1"])
+
+    assert result.exit_code == 0, result.output
+    assert captured_worker["config"].host == "10.0.0.5"

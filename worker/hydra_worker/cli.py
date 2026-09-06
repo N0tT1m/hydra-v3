@@ -134,12 +134,22 @@ def cli(verbose: bool, log_format: str):
     type=int,
     help="Port for pipeline communication (default: 6000)",
 )
+@click.option(
+    "--host",
+    envvar="HYDRA_WORKER_HOST",
+    default="",
+    help="Address peers should use to reach this worker's pipeline socket. "
+    "Defaults to the resolved local hostname, which is wrong whenever peers "
+    "cannot resolve it (e.g. a macOS worker advertising a .local name to a "
+    "Linux coordinator) -- set the LAN IP instead. Env: HYDRA_WORKER_HOST.",
+)
 def start(
     node_id: str,
     coordinator: str,
     device: str,
     dtype: str,
     pipeline_port: int,
+    host: str,
 ):
     """Start the distributed worker.
 
@@ -158,6 +168,7 @@ def start(
         device=device,
         dtype=dtype,
         pipeline_port=pipeline_port,
+        host=host or "(auto: local hostname)",
     )
 
     config = DistributedWorkerConfig(
@@ -166,6 +177,7 @@ def start(
         device=device,
         dtype=dtype,
         pipeline_port=pipeline_port,
+        host=host,
     )
 
     worker = DistributedWorker(config)
