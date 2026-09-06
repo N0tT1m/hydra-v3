@@ -318,6 +318,31 @@ def test_setup_pipeline_connects_upstream(ctx):
         upstream.close()
 
 
+def test_repeated_setup_pipeline_does_not_leak_the_previous_pull_socket(ctx):
+    """The coordinator re-broadcasts topology on every load/rebalance.
+
+    A leaked PULL socket stays connected to the upstream PUSH, which then
+    round-robins hidden states across both peers. Whatever lands on the
+    orphaned socket is never read, so those sequences hang forever.
+    """
+    upstream = ctx.socket(zmq.PUSH)
+    upstream.setsockopt(zmq.LINGER, 0)
+    addr, _ = bind_random(upstream)
+
+    handler = make_handler("tcp://127.0.0.1:1", port_base=0)
+    try:
+        handler.setup_pipeline(prev_address=addr, next_address=None)
+        first = handler.pull
+        handler.setup_pipeline(prev_address=addr, next_address=None)
+        second = handler.pull
+
+        assert second is not first, "expected a fresh PULL socket"
+        assert first.closed, "previous PULL socket was leaked, still connected upstream"
+    finally:
+        handler.close()
+        upstream.close()
+
+
 # --- hidden-state transfer --------------------------------------------------
 
 

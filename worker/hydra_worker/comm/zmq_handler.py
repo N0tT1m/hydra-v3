@@ -165,6 +165,20 @@ class ZMQHandler:
         case we drop any pre-reserved PUSH socket.
         """
         if prev_address:
+            # Close any previous PULL socket first. The coordinator re-sends
+            # the topology on every model load / rebalance, and a leaked
+            # socket stays connected upstream: the sender's PUSH then
+            # round-robins hidden states across both peers, and everything
+            # routed to the orphaned socket is never read, so those requests
+            # hang forever.
+            if self.pull is not None:
+                try:
+                    self.pull.setsockopt(zmq.LINGER, 0)
+                    self.pull.close()
+                except zmq.ZMQError:
+                    pass
+                self.pull = None
+
             self.pull = self.context.socket(zmq.PULL)
             self.pull.setsockopt(zmq.RCVHWM, 4)
             self.pull.connect(prev_address)
