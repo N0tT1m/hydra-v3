@@ -1,0 +1,147 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # The end-to-end job downloads a real model, so it is opt-in.
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: "Run the tiny-model end-to-end jobs (downloads ~1GB)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Install libzmq (required by pebbe/zmq4)
+        run: sudo apt-get update && sudo apt-get install -y libzmq3-dev
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go test
+        run: go test -race -timeout 300s -coverprofile=coverage.out ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -1
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install test deps
+        # These are the runtime deps the unit tests actually import. The CPU
+        # torch wheel keeps CI wall time bounded; safetensors + transformers
+        # are needed because the tests load synthetic checkpoints, and psutil
+        # backs the CPU/MPS memory probes in core/device.py.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install \
+            numpy msgpack pyzmq structlog click psutil \
+            safetensors transformers \
+            pytest pytest-asyncio pytest-cov
+
+      - name: pytest
+        run: python -m pytest worker/tests -v --cov=hydra_worker --cov-report=term
+        working-directory: worker
+
+  smoke:
+    name: Smoke (boot + dead-node)
+    runs-on: ubuntu-latest
+    needs: [go, python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev netcat-openbsd curl
+          python -m pip install --upgrade pip
+          python -m pip install pyzmq
+
+      - name: Coordinator smoke
+        run: ./scripts/smoke.sh
+
+      - name: Fake-worker handshake
+        run: python scripts/integration_handshake.py
+
+      - name: Dead-node transition
+        run: python scripts/integration_dead_node.py
+
+      - name: Model lifecycle (load / rebalance / unload / hot-swap)
+        run: python scripts/integration_model_lifecycle.py
+
+  e2e:
+    name: End-to-end (tiny model)
+    runs-on: ubuntu-latest
+    needs: [smoke]
+    # Downloads a real checkpoint and runs a full generation, so it is only
+    # triggered by hand.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzmq3-dev
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ./worker
+
+      - name: Single-worker generation
+        run: python scripts/integration_tiny_model.py
+
+      - name: Multi-worker pipeline generation
+        run: python scripts/integration_multi_worker.py

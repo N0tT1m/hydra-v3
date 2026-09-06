@@ -1,0 +1,257 @@
+"""Device detection and memory management."""
+
+from dataclasses import dataclass
+from typing import Optional, Tuple
+import torch
+import structlog
+
+log = structlog.get_logger()
+
+
+@dataclass
+class DeviceInfo:
+    """Information about a compute device."""
+
+    device_type: str  # "cuda", "mps", "cpu"
+    device_index: int
+    name: str
+    total_memory: int  # bytes
+    free_memory: int  # bytes
+    compute_capability: Optional[Tuple[int, int]] = None
+
+
+def detect_device(device_str: str = "auto") -> DeviceInfo:
+    """Detect available compute device.
+
+    Args:
+        device_str: Device specification ("cuda:0", "mps", "cpu", "auto")
+
+    Returns:
+        DeviceInfo with device details
+    """
+    log.info("Detecting device", requested=device_str)
+
+    if device_str == "auto":
+        log.info(
+            "Auto-detection",
+            cuda_available=torch.cuda.is_available(),
+            cuda_device_count=torch.cuda.device_count() if torch.cuda.is_available() else 0,
+            mps_available=torch.backends.mps.is_available(),
+        )
+        if torch.cuda.is_available():
+            idx = _find_best_cuda_device()
+            info = _get_cuda_info(idx)
+            log.info(
+                "Selected CUDA device",
+                index=idx,
+                name=info.name,
+                vram_gb=round(info.total_memory / (1024**3), 2),
+                compute_capability=info.compute_capability,
+            )
+            return info
+        elif torch.backends.mps.is_available():
+            info = _get_mps_info()
+            log.info("Selected MPS device", name=info.name)
+            return info
+        else:
+            info = _get_cpu_info()
+            log.warning("No GPU detected, falling back to CPU")
+            return info
+
+    if device_str.startswith("cuda"):
+        parts = device_str.split(":")
+        idx = int(parts[1]) if len(parts) > 1 else 0
+        info = _get_cuda_info(idx)
+        log.info(
+            "Using CUDA device",
+            index=idx,
+            name=info.name,
+            vram_gb=round(info.total_memory / (1024**3), 2),
+        )
+        return info
+    elif device_str == "mps":
+        info = _get_mps_info()
+        log.info("Using MPS device", name=info.name)
+        return info
+    else:
+        info = _get_cpu_info()
+        log.info("Using CPU device")
+        return info
+
+
+def _find_best_cuda_device() -> int:
+    """Find the CUDA device with the most free memory."""
+    device_count = torch.cuda.device_count()
+    if device_count <= 1:
+        return 0
+
+    best_idx = 0
+    best_free = 0
+    for idx in range(device_count):
+        props = torch.cuda.get_device_properties(idx)
+        free = props.total_memory - torch.cuda.memory_allocated(idx)
+        log.debug("CUDA device scan", index=idx, name=props.name, free_gb=round(free / (1024**3), 2))
+        if free > best_free:
+            best_free = free
+            best_idx = idx
+
+    return best_idx
+
+
+def _get_cuda_info(idx: int) -> DeviceInfo:
+    """Get CUDA device information."""
+    if not torch.cuda.is_available():
+        log.error(
+            "CUDA requested but not available",
+            cuda_built=torch.backends.cuda.is_built(),
+            cudnn_available=torch.backends.cudnn.is_available() if torch.backends.cuda.is_built() else False,
+        )
+        raise RuntimeError("CUDA not available - check PyTorch installation and NVIDIA drivers")
+
+    device_count = torch.cuda.device_count()
+    if idx >= device_count:
+        available = [f"cuda:{i}" for i in range(device_count)]
+        log.error(
+            "Invalid CUDA device index",
+            requested=f"cuda:{idx}",
+            device_count=device_count,
+            available_devices=available,
+        )
+        raise RuntimeError(
+            f"CUDA device cuda:{idx} not found. "
+            f"Available devices: {', '.join(available) if available else 'none'}"
+        )
+
+    props = torch.cuda.get_device_properties(idx)
+    total = props.total_memory
+    free = total - torch.cuda.memory_allocated(idx)
+
+    return DeviceInfo(
+        device_type="cuda",
+        device_index=idx,
+        name=props.name,
+        total_memory=total,
+        free_memory=free,
+        compute_capability=(props.major, props.minor),
+    )
+
+
+def _get_mps_info() -> DeviceInfo:
+    """Get Apple MPS device information."""
+    import psutil
+
+    mem = psutil.virtual_memory()
+    # MPS uses unified memory - estimate GPU portion
+    gpu_total = int(mem.total * 0.75)
+    gpu_free = int(mem.available * 0.75)
+
+    return DeviceInfo(
+        device_type="mps",
+        device_index=0,
+        name="Apple Silicon GPU",
+        total_memory=gpu_total,
+        free_memory=gpu_free,
+    )
+
+
+def _get_cpu_info() -> DeviceInfo:
+    """Get CPU device information."""
+    import psutil
+
+    mem = psutil.virtual_memory()
+
+    return DeviceInfo(
+        device_type="cpu",
+        device_index=0,
+        name="CPU",
+        total_memory=mem.total,
+        free_memory=mem.available,
+    )
+
+
+class MemoryTracker:
+    """Track and manage GPU/CPU memory usage."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+
+    def get_device_info(self) -> DeviceInfo:
+        """Get current device information."""
+        if self.device.type == "cuda":
+            return _get_cuda_info(self.device.index or 0)
+        elif self.device.type == "mps":
+            return _get_mps_info()
+        else:
+            return _get_cpu_info()
+
+    def get_vram_gb(self) -> float:
+        """Get total VRAM in GB."""
+        info = self.get_device_info()
+        return info.total_memory / (1024**3)
+
+    def get_free_vram_gb(self) -> float:
+        """Get free VRAM in GB."""
+        info = self.get_device_info()
+        return info.free_memory / (1024**3)
+
+    def estimate_layer_memory(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        dtype: torch.dtype,
+    ) -> int:
+        """Estimate memory for one transformer layer.
+
+        Args:
+            hidden_size: Model hidden dimension
+            intermediate_size: FFN intermediate dimension
+            num_heads: Number of attention heads
+            dtype: Data type
+
+        Returns:
+            Estimated memory in bytes
+        """
+        bytes_per_param = {
+            torch.float32: 4,
+            torch.float16: 2,
+            torch.bfloat16: 2,
+            torch.float8_e4m3fn: 1,
+        }.get(dtype, 2)
+
+        # Attention: Q, K, V, O projections
+        attn_params = 4 * hidden_size * hidden_size
+        # MLP: gate, up, down projections (for SwiGLU)
+        mlp_params = 3 * hidden_size * intermediate_size
+        # Norms
+        norm_params = 2 * hidden_size
+
+        total_params = attn_params + mlp_params + norm_params
+        return total_params * bytes_per_param
+
+    def calculate_max_layers(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        num_heads: int,
+        dtype: torch.dtype,
+        reserve_gb: float = 2.0,
+    ) -> int:
+        """Calculate how many layers can fit in available VRAM.
+
+        Args:
+            hidden_size: Model hidden dimension
+            intermediate_size: FFN intermediate dimension
+            num_heads: Number of attention heads
+            dtype: Data type
+            reserve_gb: GB to reserve for KV cache, activations
+
+        Returns:
+            Maximum number of layers
+        """
+        info = self.get_device_info()
+        available = info.free_memory - int(reserve_gb * 1024**3)
+        layer_mem = self.estimate_layer_memory(
+            hidden_size, intermediate_size, num_heads, dtype
+        )
+        return max(1, available // layer_mem)

@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+coverage.out
+coverage.html
+
+# Compiled coordinator binary (built by `make build`)
+/hydra
+/hydra.exe
+
+# Local configuration (copy config.example.toml to config.toml)
+config.toml
+
+# Python caches & virtualenv
+__pycache__/
+*.py[cod]
+*.egg-info/
+worker/venv/
+worker/.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local tool config (not project config)
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
