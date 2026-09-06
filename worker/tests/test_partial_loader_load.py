@@ -501,3 +501,45 @@ def test_partial_transformer_reports_its_slice():
     )
     assert partial.num_layers == 4
     assert partial.hidden_size == HIDDEN
+
+
+# --- dtype fidelity ---------------------------------------------------------
+#
+# Regression: transformers layer classes allocate parameters at torch's
+# *default* dtype. Loading bf16/fp16 weights with Tensor.copy_ casts the
+# source down to the destination, so a layer built at the fp32 default stayed
+# fp32 while the embedding (built with an explicit dtype) was fp16. That
+# doubled VRAM and made SDPA reject the run: the causal mask is derived from
+# the fp16 hidden states while the query stayed fp32.
+
+
+@pytest.mark.parametrize("dtype_str,expected", [("float16", torch.float16)])
+def test_loaded_layers_use_the_requested_dtype(model_dir, dtype_str, expected):
+    loader = PartialModelLoader(str(model_dir), torch.device("cpu"), dtype_str)
+    model, _ = loader.load_partial_model(
+        0, 2, include_embedding=True, include_lm_head=True
+    )
+
+    offenders = [
+        name for name, p in model.named_parameters() if p.dtype is not expected
+    ]
+    assert not offenders, f"parameters not in {expected}: {offenders}"
+
+
+def test_embedding_and_layers_agree_on_dtype(model_dir):
+    """The mismatch itself is the bug, independent of which dtype wins."""
+    loader = PartialModelLoader(str(model_dir), torch.device("cpu"), "float16")
+    model, _ = loader.load_partial_model(
+        0, 2, include_embedding=True, include_lm_head=False
+    )
+
+    embed_dtype = model.embed_tokens.weight.dtype
+    layer_dtypes = {p.dtype for p in model.layers.parameters()}
+    assert layer_dtypes == {embed_dtype}
+
+
+def test_default_dtype_is_restored_after_loading(model_dir):
+    before = torch.get_default_dtype()
+    loader = PartialModelLoader(str(model_dir), torch.device("cpu"), "float16")
+    loader.load_partial_model(0, 2, include_embedding=True, include_lm_head=True)
+    assert torch.get_default_dtype() is before

@@ -1,5 +1,6 @@
 """Partial model loading - load only specific layers for distributed inference."""
 
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 import json
@@ -21,6 +22,23 @@ try:
 except ImportError:
     HAS_BITSANDBYTES = False
     log.warning("bitsandbytes not available - quantization will use fallback method")
+
+
+@contextmanager
+def _default_dtype(dtype: torch.dtype):
+    """Temporarily make `dtype` the default for module construction.
+
+    transformers layer classes build their parameters at the *default* dtype.
+    Without this, a layer is created in float32 and stays float32 even after
+    bf16/fp16 weights are copied into it, because Tensor.copy_ casts the source
+    to the destination dtype rather than the other way around.
+    """
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 class PartialTransformer(nn.Module):
@@ -545,16 +563,20 @@ class PartialModelLoader:
         return self.config
 
     def _create_rms_norm(self):
-        """Create RMSNorm layer."""
-        try:
-            from transformers.models.llama.modeling_llama import LlamaRMSNorm
-            return LlamaRMSNorm(
-                self.config.hidden_size,
-                eps=getattr(self.config, "rms_norm_eps", 1e-5)
-            )
-        except ImportError:
-            # Fallback to manual implementation
-            return RMSNorm(self.config.hidden_size, getattr(self.config, "rms_norm_eps", 1e-5))
+        """Create RMSNorm layer at the loader's dtype.
+
+        Same trap as the decoder layers: constructed at the default dtype it
+        would come out fp32, then stay fp32 when bf16 weights are copied in.
+        """
+        eps = getattr(self.config, "rms_norm_eps", 1e-5)
+        with _default_dtype(self.dtype):
+            try:
+                from transformers.models.llama.modeling_llama import LlamaRMSNorm
+                norm = LlamaRMSNorm(self.config.hidden_size, eps=eps)
+            except ImportError:
+                # Fallback to manual implementation
+                norm = RMSNorm(self.config.hidden_size, eps)
+        return norm.to(dtype=self.dtype)
 
     def _create_and_load_layer(self, layer_idx: int, model_class) -> nn.Module:
         """Create a layer and load its weights."""
@@ -569,16 +591,25 @@ class PartialModelLoader:
             if tensor is not None:
                 weights[short_name] = tensor
 
-        # Create the appropriate layer based on model type (on CPU)
-        if "qwen" in model_type:
-            layer = self._create_qwen_layer(layer_idx, weights)
-        elif "llama" in model_type:
-            layer = self._create_llama_layer(layer_idx, weights)
-        elif "mistral" in model_type or "mixtral" in model_type:
-            layer = self._create_mistral_layer(layer_idx, weights)
-        else:
-            # Generic fallback - try to auto-detect from weight names
-            layer = self._create_generic_layer(layer_idx, weights)
+        # Create the appropriate layer based on model type (on CPU).
+        # _default_dtype matters: these classes allocate their parameters at
+        # the default dtype, and copying bf16 weights into an fp32 parameter
+        # leaves it fp32. That silently doubles VRAM and, because the causal
+        # mask is built from the (bf16) hidden states, makes SDPA fail with
+        # "Expected attn_mask dtype ... to match query dtype".
+        with _default_dtype(self.dtype):
+            if "qwen" in model_type:
+                layer = self._create_qwen_layer(layer_idx, weights)
+            elif "llama" in model_type:
+                layer = self._create_llama_layer(layer_idx, weights)
+            elif "mistral" in model_type or "mixtral" in model_type:
+                layer = self._create_mistral_layer(layer_idx, weights)
+            else:
+                # Generic fallback - try to auto-detect from weight names
+                layer = self._create_generic_layer(layer_idx, weights)
+
+        # Belt and braces: a creator that hardcodes a dtype still lands here.
+        layer = layer.to(dtype=self.dtype)
 
         # Apply quantization (replaces linear layers with bitsandbytes versions)
         if self.quantize:
