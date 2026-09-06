@@ -9,7 +9,7 @@ import gc
 import torch
 import torch.nn as nn
 from safetensors import safe_open
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer, PretrainedConfig
 from huggingface_hub import snapshot_download
 import structlog
 
@@ -289,12 +289,22 @@ class PartialModelLoader:
                 log.error("Failed to download model", error=str(e))
                 raise
 
-        # Load config
-        self.config = AutoConfig.from_pretrained(str(self.model_path), trust_remote_code=True)
+        # Load config. Multimodal checkpoints (Qwen3.5, and VLMs generally)
+        # nest the decoder's own hyperparameters under `text_config` and keep
+        # only wrapper fields at the top level, so reading num_hidden_layers /
+        # hidden_size off the outer object gets the wrong thing or nothing.
+        # We keep the full config for reference and use the text half for
+        # everything that describes the decoder we actually load.
+        self.full_config = AutoConfig.from_pretrained(
+            str(self.model_path), trust_remote_code=True
+        )
+        self.config = self._resolve_text_config(self.full_config)
+        self.is_multimodal = self.config is not self.full_config
         self.arch = self._detect_architecture()
         self.is_moe = self._is_moe_model()
 
         # Build weight index
+        self._layer_prefix: Optional[str] = None
         self.weight_files = self._find_weight_files()
         self.weight_index = self._build_weight_index()
 
@@ -308,6 +318,37 @@ class PartialModelLoader:
             weight_files=len(self.weight_files),
         )
 
+    @staticmethod
+    def _resolve_text_config(config):
+        """Return the sub-config describing the text decoder.
+
+        transformers may hand back `text_config` either as a config object or
+        as the raw dict straight from config.json, depending on whether the
+        outer class declares it as a sub-config. Normalize both to something
+        with attribute access.
+        """
+        text = getattr(config, "text_config", None)
+        if text is None:
+            return config
+        if isinstance(text, dict):
+            fields = {k: v for k, v in text.items() if k != "model_type"}
+            model_type = text.get("model_type")
+            if model_type:
+                try:
+                    # for_model takes model_type positionally, so it must not
+                    # also appear in the kwargs -- passing it twice raises
+                    # TypeError and silently drops us onto the generic config,
+                    # which lacks the architecture's defaults.
+                    return AutoConfig.for_model(model_type, **fields)
+                except Exception as e:  # unknown to this transformers version
+                    log.warning(
+                        "Could not build a typed text_config; using a generic one",
+                        model_type=model_type,
+                        error=str(e),
+                    )
+            return PretrainedConfig.from_dict(text)
+        return text
+
     def _detect_architecture(self) -> str:
         """Detect model architecture from config."""
         model_type = getattr(self.config, "model_type", "").lower()
@@ -318,6 +359,10 @@ class PartialModelLoader:
             return "mistral"
         elif "mixtral" in model_type or ("mistral" in model_type and "moe" in model_type):
             return "mixtral"
+        elif "qwen3_5" in model_type:
+            # Hybrid linear/full attention decoder. Must be matched before the
+            # generic "qwen3" rule below, which would route it to Qwen3-MoE.
+            return "qwen3_5"
         elif "qwen2_moe" in model_type or "qwen3" in model_type:
             return "qwen2_moe"
         elif "qwen" in model_type:
@@ -372,9 +417,34 @@ class PartialModelLoader:
         return index
 
     def _get_layer_prefix(self) -> str:
-        """Get the weight name prefix for layers based on architecture."""
-        # Most models use model.layers.X
-        return "model.layers."
+        """Get the weight name prefix for layers based on architecture.
+
+        Multimodal checkpoints put the text decoder under
+        `model.language_model.` and ship a vision tower (`model.visual.`) plus,
+        for Qwen3.5, a multi-token-prediction head (`mtp.`) alongside it. We
+        load the text decoder only, so detect the prefix from the index rather
+        than assuming the dense-text layout.
+        """
+        if self._layer_prefix is None:
+            for candidate in ("model.language_model.layers.", "model.layers."):
+                if any(n.startswith(candidate) for n in self.weight_index):
+                    self._layer_prefix = candidate
+                    break
+            else:
+                self._layer_prefix = "model.layers."
+        return self._layer_prefix
+
+    def _text_weight_name(self, suffix: str) -> str:
+        """Map a canonical text-model weight name onto this checkpoint.
+
+        `suffix` is written in the dense-text layout (e.g. "model.embed_tokens.
+        weight"); for a multimodal checkpoint it becomes
+        "model.language_model.embed_tokens.weight".
+        """
+        if self._get_layer_prefix().startswith("model.language_model."):
+            if suffix.startswith("model.") and not suffix.startswith("model.language_model."):
+                return suffix.replace("model.", "model.language_model.", 1)
+        return suffix
 
     def _load_tensor(self, name: str) -> Optional[torch.Tensor]:
         """Load a single tensor by name."""
@@ -436,7 +506,9 @@ class PartialModelLoader:
 
         # Load embedding if needed
         if include_embedding:
-            embed_weight = self._load_tensor("model.embed_tokens.weight")
+            embed_weight = self._load_tensor(
+                self._text_weight_name("model.embed_tokens.weight")
+            )
             if embed_weight is not None:
                 partial.embed_tokens = nn.Embedding(
                     self.config.vocab_size,
@@ -452,7 +524,17 @@ class PartialModelLoader:
         # ALL workers need this, not just the first one
         model_type = getattr(self.config, "model_type", "").lower()
         try:
-            if "qwen3" in model_type or (self.is_moe and "qwen" in model_type):
+            if "qwen3_5" in model_type:
+                from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                    Qwen3_5TextRotaryEmbedding,
+                )
+                if self.device.type == "cuda":
+                    with torch.cuda.device(self.device):
+                        partial.rotary_emb = Qwen3_5TextRotaryEmbedding(self.config).to(self.device)
+                else:
+                    partial.rotary_emb = Qwen3_5TextRotaryEmbedding(self.config).to(self.device)
+                log.info("Created rotary embedding (Qwen3.5)")
+            elif "qwen3" in model_type or (self.is_moe and "qwen" in model_type):
                 from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbedding
                 if self.device.type == "cuda":
                     with torch.cuda.device(self.device):
@@ -498,7 +580,7 @@ class PartialModelLoader:
 
         # Load norm and lm_head if needed
         if include_lm_head:
-            norm_weight = self._load_tensor("model.norm.weight")
+            norm_weight = self._load_tensor(self._text_weight_name("model.norm.weight"))
             if norm_weight is not None:
                 partial.norm = self._create_rms_norm()
                 partial.norm.weight.data.copy_(norm_weight.to(self.device))
@@ -519,7 +601,9 @@ class PartialModelLoader:
                 else:
                     # We own lm_head but not embedding — load the embedding
                     # weight directly for reuse.
-                    lm_head_weight = self._load_tensor("model.embed_tokens.weight")
+                    lm_head_weight = self._load_tensor(
+                        self._text_weight_name("model.embed_tokens.weight")
+                    )
                     if lm_head_weight is not None:
                         log.info("lm_head absent; loaded embed_tokens.weight for reuse (tied)")
 
@@ -598,7 +682,9 @@ class PartialModelLoader:
         # mask is built from the (bf16) hidden states, makes SDPA fail with
         # "Expected attn_mask dtype ... to match query dtype".
         with _default_dtype(self.dtype):
-            if "qwen" in model_type:
+            if "qwen3_5" in model_type:
+                layer = self._create_qwen3_5_layer(layer_idx, weights)
+            elif "qwen" in model_type:
                 layer = self._create_qwen_layer(layer_idx, weights)
             elif "llama" in model_type:
                 layer = self._create_llama_layer(layer_idx, weights)
@@ -934,6 +1020,24 @@ class PartialModelLoader:
         except Exception as e:
             log.warning(f"Failed to create int4 linear: {e}")
             return None
+
+    def _create_qwen3_5_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
+        """Create a Qwen3.5 decoder layer.
+
+        Qwen3.5 is hybrid: `text_config.layer_types` marks each layer as
+        "linear_attention" or "full_attention" and Qwen3_5DecoderLayer reads
+        that to pick its token mixer, so the layer index matters here in a way
+        it does not for a uniform decoder.
+        """
+        self._patch_config_defaults()
+
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+        with torch.device("cpu"):
+            layer = Qwen3_5DecoderLayer(self.config, layer_idx)
+
+        self._load_weights_into_layer(layer, weights)
+        return layer
 
     def _create_qwen_layer(self, layer_idx: int, weights: Dict[str, torch.Tensor]) -> nn.Module:
         """Create a Qwen/Qwen2 layer on CPU, load weights, then move to GPU."""
