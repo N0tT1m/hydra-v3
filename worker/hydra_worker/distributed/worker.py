@@ -17,6 +17,45 @@ from hydra_worker.distributed.pipeline import (
 from hydra_worker.comm.zmq_handler import ZMQHandler
 
 
+# Dtypes whose finite range is narrow enough that values arriving from a
+# wider-range peer can saturate. bf16 shares fp32's exponent range; fp16 tops
+# out at 65504.
+_NARROW_DTYPES = {torch.float16}
+
+
+def _cast_hidden_states(
+    hidden_states: "torch.Tensor", target: "torch.dtype", sequence_id: str
+) -> "torch.Tensor":
+    """Cast hidden states to this node's compute dtype, refusing to corrupt.
+
+    A split pipeline can have nodes computing in different dtypes. Narrowing
+    bf16 to fp16 quietly maps anything past 65504 to inf, which then spreads
+    as NaN through the rest of the model: the run does not fail, it just
+    returns wrong tokens. That produced nondeterministic output at
+    temperature 0 on Qwen3.5-27B before MPS kept bf16.
+
+    Widening (fp16 -> bf16/fp32) is always safe. Narrowing is checked, and a
+    loud failure is far better than silent garbage.
+    """
+    source = hidden_states.dtype
+    converted = hidden_states.to(target)
+
+    if target not in _NARROW_DTYPES or source in _NARROW_DTYPES:
+        return converted
+
+    bad = int((~torch.isfinite(converted)).sum().item())
+    if bad:
+        finite_max = float(hidden_states.abs().max().item())
+        raise ValueError(
+            f"casting hidden states {source} -> {target} produced {bad} "
+            f"non-finite value(s) (largest input magnitude {finite_max:.1f}, "
+            f"{target} saturates at 65504). This node computes in {target} "
+            f"while upstream sent {source}; run them at the same dtype, or use "
+            f"a dtype with a wider exponent range. sequence_id={sequence_id}"
+        )
+    return converted
+
+
 def _cache_accepts_config(cache_cls) -> bool:
     """Whether this transformers version's Cache takes a `config` kwarg."""
     try:
@@ -480,7 +519,9 @@ class DistributedWorker:
             return
 
         if self.model and hasattr(self.model, "dtype") and hidden_states.dtype != self.model.dtype:
-            hidden_states = hidden_states.to(self.model.dtype)
+            hidden_states = _cast_hidden_states(
+                hidden_states, self.model.dtype, sequence_id
+            )
 
         log.info(
             "Received hidden states from upstream",

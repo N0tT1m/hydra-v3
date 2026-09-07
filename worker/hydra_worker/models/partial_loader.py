@@ -1,6 +1,7 @@
 """Partial model loading - load only specific layers for distributed inference."""
 
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
 import json
@@ -22,6 +23,29 @@ try:
 except ImportError:
     HAS_BITSANDBYTES = False
     log.warning("bitsandbytes not available - quantization will use fallback method")
+
+
+@lru_cache(maxsize=1)
+def _mps_supports_bfloat16() -> bool:
+    """Whether this torch can run bf16 on MPS, decided by trying it.
+
+    Cheap (a few tiny kernels) and cached for the process. Covers the ops a
+    decoder layer actually leans on rather than just checking a version.
+    """
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        return False
+    try:
+        x = torch.randn(8, 8, device="mps", dtype=torch.bfloat16)
+        y = x @ x
+        y = torch.softmax(y, dim=-1)
+        y = torch.nn.functional.silu(y)
+        y = torch.nn.functional.layer_norm(y, (y.shape[-1],))
+        # Force the kernels to actually run rather than queue.
+        float(y.flatten()[0].to("cpu"))
+        return True
+    except Exception as e:  # noqa: BLE001 - any failure means "not supported"
+        log.warning("MPS bf16 probe failed; will use fp16", error=str(e))
+        return False
 
 
 @contextmanager
@@ -1109,13 +1133,34 @@ class PartialModelLoader:
 
     @staticmethod
     def _maybe_downgrade_dtype(requested: str, device: torch.device) -> str:
-        """bf16 on MPS has gaps in kernel coverage (many ops fall back to
-        CPU), so inference runs at a small fraction of fp16 speed. Downgrade
-        silently with a warning so users don't hit a footgun."""
+        """Keep bf16 on MPS when this torch can actually run it.
+
+        Older MPS builds had gaps in bf16 kernel coverage, so this
+        unconditionally downgraded to fp16. That is now actively harmful on
+        two counts:
+
+        - Correctness. fp16 tops out at 65504 while bf16 carries fp32's
+          exponent range. On a split pipeline the upstream node computes in
+          bf16 and the downstream node in fp16, so hidden states are narrowed
+          at the boundary and large activations saturate to inf, then
+          propagate as NaN. Observed on Qwen3.5-27B as nondeterministic output
+          at temperature 0 -- the same prompt yielding English, another
+          language, or mojibake.
+        - Speed. On torch 2.14 / M3 Max, bf16 measures *faster* than fp16
+          (5755 vs 3913 GFLOP/s), with softmax, layernorm, SDPA and silu all
+          running natively.
+
+        So probe instead of assuming, and only downgrade where the runtime
+        genuinely cannot do bf16.
+        """
         if device.type == "mps" and requested == "bfloat16":
+            if _mps_supports_bfloat16():
+                return requested
             log.warning(
-                "MPS: downgrading bfloat16 -> float16 (MPS bf16 kernels are "
-                "incomplete; many ops silently fall back to CPU)."
+                "MPS: downgrading bfloat16 -> float16 (this torch build cannot "
+                "run bf16 on MPS). Note that fp16 saturates at 65504, so a "
+                "pipeline whose other nodes compute in bf16 may lose large "
+                "activations at the boundary."
             )
             return "float16"
         return requested

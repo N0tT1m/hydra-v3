@@ -49,10 +49,16 @@ def test_parse_dtype_unknown_defaults_to_bf16():
 
 # --- _maybe_downgrade_dtype -------------------------------------------------
 
-def test_downgrade_bf16_on_mps():
-    # MPS bf16 kernels are incomplete; loader silently downgrades to fp16.
+def test_bf16_on_mps_follows_runtime_capability():
+    # Older MPS builds could not run bf16, so the loader downgraded to fp16
+    # unconditionally. That created a mixed-dtype pipeline (bf16 upstream,
+    # fp16 downstream) in which large activations saturated fp16's 65504 and
+    # silently became inf. The decision is now a runtime probe: keep bf16
+    # wherever torch can actually run it.
+    from hydra_worker.models.partial_loader import _mps_supports_bfloat16
+
     got = PartialModelLoader._maybe_downgrade_dtype("bfloat16", torch.device("mps"))
-    assert got == "float16"
+    assert got == ("bfloat16" if _mps_supports_bfloat16() else "float16")
 
 
 def test_no_downgrade_bf16_on_cpu():
