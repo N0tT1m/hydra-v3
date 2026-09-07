@@ -392,25 +392,16 @@ class DistributedWorker:
         try:
             while self.running:
                 try:
-                    # Wait on every input socket at once. Polling them in
-                    # sequence meant a quiet coordinator socket held up the
-                    # hidden states behind it, adding up to the coordinator
-                    # timeout of latency to each token.
-                    ready = await self.zmq_handler.wait_readable(timeout=0.25)
+                    msg = await self.zmq_handler.receive(timeout=0.25)
+                    if msg:
+                        await self._handle_message(msg)
 
-                    if ready.get("coordinator"):
-                        msg = await self.zmq_handler.receive(timeout=0.0)
-                        if msg:
-                            await self._handle_message(msg)
+                    broadcast = await self.zmq_handler.check_broadcast()
+                    if broadcast:
+                        await self._handle_broadcast(broadcast)
 
-                    if ready.get("broadcast"):
-                        broadcast = await self.zmq_handler.check_broadcast()
-                        if broadcast:
-                            await self._handle_broadcast(broadcast)
-
-                    if ready.get("upstream"):
-                        if self.model and self.position and self.position != PipelinePosition.FIRST:
-                            await self._check_upstream_hidden_states()
+                    if self.model and self.position and self.position != PipelinePosition.FIRST:
+                        await self._check_upstream_hidden_states()
 
                     consecutive_errors = 0
                 except asyncio.CancelledError:
