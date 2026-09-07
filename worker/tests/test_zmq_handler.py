@@ -462,3 +462,47 @@ def test_shift_port_is_reused_by_the_handler():
     # Covered in depth by test_zmq_address.py; this just pins the contract
     # the handler depends on.
     assert shift_port("tcp://h:5555", 1) == "tcp://h:5556"
+
+
+# --- concurrent socket readiness --------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_readable_wakes_on_upstream_while_coordinator_is_quiet(ctx):
+    """The latency bug: hidden states must not queue behind a silent DEALER.
+
+    The event loop used to read the coordinator socket first with its own
+    timeout, so an idle coordinator delayed every token by that timeout. The
+    poller must report the upstream socket the moment it has data.
+    """
+    import time
+
+    upstream = ctx.socket(zmq.PUSH)
+    upstream.setsockopt(zmq.LINGER, 0)
+    addr, _ = bind_random(upstream)
+
+    handler = make_handler("tcp://127.0.0.1:1", port_base=0)
+    try:
+        handler.setup_pipeline(prev_address=addr, next_address=None)
+        await asyncio.sleep(0.05)  # let the connection establish
+        upstream.send(b"hidden-states")
+
+        start = time.perf_counter()
+        ready = await handler.wait_readable(timeout=2.0)
+        elapsed = time.perf_counter() - start
+
+        assert ready.get("upstream") is True
+        assert elapsed < 0.5, f"took {elapsed:.2f}s; upstream should wake immediately"
+    finally:
+        handler.close()
+        upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_readable_returns_when_nothing_is_ready(ctx):
+    handler = make_handler("tcp://127.0.0.1:1", port_base=0)
+    try:
+        ready = await handler.wait_readable(timeout=0.05)
+        assert not any(ready.values())
+    finally:
+        handler.close()

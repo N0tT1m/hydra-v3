@@ -23,8 +23,21 @@ class FakeZMQ:
     def __init__(self, script):
         self._script = list(script)
         self.receive_calls = 0
+        self.wait_calls = 0
         self.pull = None
         self.push = None
+
+    async def wait_readable(self, timeout=0.25):
+        """Report the coordinator socket readable while the script has items.
+
+        Mirrors the real handler: the loop only calls receive() for a socket
+        the poller flagged, so an empty script must still yield to the loop.
+        """
+        self.wait_calls += 1
+        if self._script:
+            return {"coordinator": True}
+        await asyncio.sleep(0.01)
+        return {}
 
     async def receive(self, timeout):
         self.receive_calls += 1

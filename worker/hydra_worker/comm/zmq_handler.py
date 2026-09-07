@@ -87,6 +87,49 @@ class ZMQHandler:
 
         self._connected = False
 
+        # Poller over every readable socket. Rebuilt whenever a socket is
+        # created or replaced (see _invalidate_poller).
+        self._poller: Optional[zmq.asyncio.Poller] = None
+
+    def _invalidate_poller(self):
+        """Drop the cached poller so the next wait rebuilds it."""
+        self._poller = None
+
+    def _readable_sockets(self):
+        return [
+            ("coordinator", self.dealer),
+            ("broadcast", self.broadcast_sub),
+            ("upstream", self.pull),
+        ]
+
+    async def wait_readable(self, timeout: float = 0.25) -> Dict[str, bool]:
+        """Block until any input socket has data, or `timeout` elapses.
+
+        The event loop previously polled its sockets in sequence, each with
+        its own receive timeout, so a quiet coordinator socket delayed reading
+        hidden states by up to that timeout -- a latency floor paid on every
+        single token of every generation. Waiting on all of them at once means
+        whichever one becomes readable wakes us immediately.
+        """
+        named = [(name, sock) for name, sock in self._readable_sockets() if sock is not None]
+        if not named:
+            await asyncio.sleep(timeout)
+            return {}
+
+        if self._poller is None:
+            self._poller = zmq.asyncio.Poller()
+            for _, sock in named:
+                self._poller.register(sock, zmq.POLLIN)
+
+        try:
+            events = dict(await self._poller.poll(timeout * 1000))
+        except zmq.ZMQError:
+            # A socket was closed underneath us; rebuild next time.
+            self._invalidate_poller()
+            return {}
+
+        return {name: sock in events for name, sock in named}
+
     async def connect(self):
         """Establish connections to coordinator."""
         log.info("Connecting to coordinator", address=self.coordinator_address)
@@ -113,6 +156,7 @@ class ZMQHandler:
         self.broadcast_sub.connect(broadcast_addr)
 
         self._connected = True
+        self._invalidate_poller()
         log.info("Connected to coordinator")
 
     def _get_metrics_address(self) -> str:
@@ -178,10 +222,12 @@ class ZMQHandler:
                 except zmq.ZMQError:
                     pass
                 self.pull = None
+                self._invalidate_poller()
 
             self.pull = self.context.socket(zmq.PULL)
             self.pull.setsockopt(zmq.RCVHWM, 4)
             self.pull.connect(prev_address)
+            self._invalidate_poller()
             log.info("Connected to upstream", address=prev_address)
 
         if next_address:
