@@ -388,11 +388,22 @@ class DistributedWorker:
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         consecutive_errors = 0
         MAX_BACKOFF = 5.0
+        # 5ms: small enough to be irrelevant next to a token's compute and
+        # network time, large enough that an idle worker is not spinning.
+        COORDINATOR_POLL_S = 0.005
 
         try:
             while self.running:
                 try:
-                    msg = await self.zmq_handler.receive(timeout=0.25)
+                    # Keep this short. The loop polls its sockets in
+                    # sequence, so whatever we wait here is added to the
+                    # latency of hidden states arriving on the PULL socket
+                    # below -- and the coordinator is silent for the whole
+                    # body of a generation, so that wait was paid on every
+                    # token. A zmq.asyncio.Poller over all three sockets
+                    # would be the tidier fix, but it deadlocks against the
+                    # concurrent heartbeat task on this same DEALER socket.
+                    msg = await self.zmq_handler.receive(timeout=COORDINATOR_POLL_S)
                     if msg:
                         await self._handle_message(msg)
 
