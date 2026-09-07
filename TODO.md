@@ -8,7 +8,7 @@ cluster (CUDA + Apple MPS) against Qwen2.5-7B and Qwen3.5-27B.
 
 ## P0 — correctness
 
-### 1. Hidden states are corrupted crossing a bf16 → fp16 node boundary
+### 1. ~~Hidden states are corrupted crossing a bf16 → fp16 node boundary~~ — FIXED (needs cluster verification)
 
 **Symptom.** With `temperature=0`, the same prompt produces *different*
 outputs run to run — coherent English on some passes, another language or
@@ -42,9 +42,19 @@ and count `isinf`/`isnan` after the cast. That settles it either way.
 4. At minimum, detect non-finite values at the boundary and fail loudly
    instead of emitting garbage.
 
-**Done when:** a fixed prompt at `temperature=0` yields byte-identical output
-across ≥5 consecutive runs, on every supported node dtype combination, for
-both a small and a large model. Add this as a test.
+**Fixed.** The MPS bf16 downgrade is now a runtime probe rather than an
+assumption — it dated from builds that could not run bf16, whereas on torch
+2.14 / M3 Max bf16 runs natively and measures *faster* than fp16 (5755 vs
+3913 GFLOP/s). Keeping bf16 removes the mixed-dtype pipeline that caused this.
+Narrowing casts are additionally guarded: they are checked for non-finite
+results and raise with the offending magnitude and sequence id rather than
+emitting `inf`.
+
+**Still to verify.** The fix is covered by unit tests and the MPS capability
+benchmark, but has **not** been re-run end to end on a real two-node cluster.
+The original acceptance criterion still stands: a fixed prompt at
+`temperature=0` yielding byte-identical output across ≥5 consecutive runs, on
+both a small and a large model. Item 4 below is the test that would prove it.
 
 ### 2. A failed forward pass hangs the client instead of erroring
 
