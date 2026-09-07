@@ -1307,3 +1307,38 @@ def test_dtype_is_passed_through_for_the_loader_to_interpret():
     worker = make_worker(dtype="int4")
 
     assert worker._get_dtype() == "int4"
+
+
+# --- advertised VRAM budget -------------------------------------------------
+
+
+def test_vram_budget_caps_what_the_node_advertises():
+    """Layers are split in proportion to reported VRAM, so the cap is the
+    only lever a node has to take a smaller share."""
+    import types
+
+    worker = make_worker()
+    worker.config.vram_budget_gb = 10.0
+    info = types.SimpleNamespace(total_memory=27 * 1024**3)
+
+    assert worker._advertised_vram_gb(info) == 10.0
+
+
+def test_vram_budget_of_zero_reports_the_real_capacity():
+    import types
+
+    worker = make_worker()
+    worker.config.vram_budget_gb = 0.0
+    info = types.SimpleNamespace(total_memory=27 * 1024**3)
+
+    assert worker._advertised_vram_gb(info) == 27.0
+
+
+def test_a_budget_larger_than_the_device_does_not_inflate_it():
+    import types
+
+    worker = make_worker()
+    worker.config.vram_budget_gb = 100.0
+    info = types.SimpleNamespace(total_memory=27 * 1024**3)
+
+    assert worker._advertised_vram_gb(info) == 27.0

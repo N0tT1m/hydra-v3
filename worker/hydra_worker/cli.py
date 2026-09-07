@@ -135,6 +135,16 @@ def cli(verbose: bool, log_format: str):
     help="Port for pipeline communication (default: 6000)",
 )
 @click.option(
+    "--vram-budget",
+    envvar="HYDRA_VRAM_BUDGET_GB",
+    default=0.0,
+    type=float,
+    help="Cap the VRAM this node advertises, in GB (0 = report actual). Layers "
+    "are split in proportion to what each node reports, so lower this on a "
+    "node whose memory is shared with the rest of the machine (Apple unified "
+    "memory) to give it a smaller share. Env: HYDRA_VRAM_BUDGET_GB.",
+)
+@click.option(
     "--host",
     envvar="HYDRA_WORKER_HOST",
     default="",
@@ -150,6 +160,7 @@ def start(
     dtype: str,
     pipeline_port: int,
     host: str,
+    vram_budget: float,
 ):
     """Start the distributed worker.
 
@@ -178,6 +189,7 @@ def start(
         dtype=dtype,
         pipeline_port=pipeline_port,
         host=host,
+        vram_budget_gb=vram_budget,
     )
 
     worker = DistributedWorker(config)

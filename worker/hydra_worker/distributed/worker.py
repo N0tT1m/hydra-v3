@@ -61,6 +61,12 @@ class DistributedWorkerConfig:
     # Host / IP this worker advertises to peers for the pipeline socket.
     # If empty, resolved from the local hostname. No outbound network probes.
     host: str = ""
+    # Cap the VRAM this node advertises, in GB. The coordinator splits layers
+    # in proportion to what each node reports, so a node whose memory is
+    # shared with the rest of the machine (Apple unified memory) can claim
+    # less than its ceiling and take a smaller share. 0 means "report the
+    # device's actual capacity".
+    vram_budget_gb: float = 0.0
     # Shared registration token. When the coordinator requires one, workers
     # pass this value in the `token` field of the register message. When
     # unset, we read from the HYDRA_WORKER_TOKEN environment variable.
@@ -170,7 +176,7 @@ class DistributedWorker:
             "node_id": self.config.node_id,
             "host": host,
             "pipeline_port": actual_port,
-            "vram_gb": device_info.total_memory / (1024**3),
+            "vram_gb": self._advertised_vram_gb(device_info),
             "capabilities": ["cuda" if self.device.type == "cuda" else self.device.type],
         }
         if token:
@@ -183,6 +189,21 @@ class DistributedWorker:
             port=actual_port,
             token_set=bool(token),
         )
+
+    def _advertised_vram_gb(self, device_info) -> float:
+        """VRAM to report to the coordinator, honouring any configured cap."""
+        actual = device_info.total_memory / (1024**3)
+        budget = self.config.vram_budget_gb
+        if budget and budget > 0:
+            capped = min(actual, budget)
+            if capped < actual:
+                log.info(
+                    "Advertising a reduced VRAM budget",
+                    actual_gb=round(actual, 2),
+                    advertised_gb=round(capped, 2),
+                )
+            return capped
+        return actual
 
     def _get_host_address(self) -> str:
         """Return the address peers should use to reach this worker.
