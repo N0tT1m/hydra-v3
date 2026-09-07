@@ -59,7 +59,7 @@ error response promptly; covered by a test that injects a forward failure.
 
 ## P1 — capacity and safety
 
-### 3. Layer distribution uses a fixed per-layer memory constant
+### 3. ~~Layer distribution uses a fixed per-layer memory constant~~ — FIXED
 
 **Symptom.** OOM on any non-trivial prompt after a large model loads:
 
@@ -81,9 +81,19 @@ into distribution instead of the constant. Separately reserve headroom for the
 KV cache as a function of context length and batch size, not a flat
 `reserved_vram_gb`.
 
-**Done when:** loading a model that would not leave room for its own KV cache
-either redistributes or refuses with a clear message, rather than loading
-successfully and OOMing on the first long prompt.
+**Fixed.** Per-layer cost is now derived from the model config (params ×
+dtype width), embedding and lm_head are charged to the nodes that hold them,
+a KV reserve is sized from `cluster.kv_reserve_tokens`, and assignments are
+clamped to node capacity. A model that cannot fit is refused with the
+arithmetic shown instead of OOMing later.
+
+**Remaining:** the dense parameter formula under-counts hybrid decoders
+(Qwen3.5's linear-attention layers have convolution and gating projections it
+does not model), covered today by a 1.30 safety factor. Reading exact tensor
+sizes from the safetensors headers would remove the guess. Also note this now
+refuses Qwen3.5-27B on a 31.4 + 22.3 GiB cluster — correctly, since it only
+ever fit by leaving 8 MiB for activations — so an explicit
+`--allow-oversubscribe` escape hatch may be worth adding for short-prompt use.
 
 ### 4. No end-to-end correctness test across a real split
 
