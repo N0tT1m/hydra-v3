@@ -9,7 +9,14 @@ node_id = "coordinator"
 heartbeat_interval = "500ms"
 unhealthy_threshold = 3
 reserved_vram_gb = 2.0
+# Fallback only. When the model's config.json can be read, per-layer memory is
+# derived from the model itself (parameter count x dtype width), because no
+# single constant is correct for every architecture: a Qwen2.5-7B layer is
+# ~0.43GiB and a Qwen3.5-27B layer is ~0.80GiB.
 memory_per_layer_gb = 0.5
+# Context length to hold memory back for, per node, so a model cannot fill
+# every byte with weights and then OOM on the first prompt. 0 reserves nothing.
+kv_reserve_tokens = 4096
 
 [auth]
 enabled = false

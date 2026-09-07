@@ -58,15 +58,21 @@ func (m *ModelManager) LoadModel(ctx context.Context, modelID, modelPath string,
 
 // loadModelLocked is LoadModel's body. Callers must hold m.mu.
 func (m *ModelManager) loadModelLocked(ctx context.Context, modelID, modelPath string, totalLayers int) error {
-	// Auto-detect layers if not specified
+	// Fetch the model's shape once: it supplies the layer count *and* the
+	// per-layer memory cost, so distribution sizes itself to this model
+	// rather than to a fixed constant.
+	shape, shapeErr := m.fetchModelShape(modelPath)
+	if shapeErr != nil {
+		log.Warn().Err(shapeErr).Msg("Could not read model shape; falling back to configured per-layer size")
+	}
+
 	if totalLayers <= 0 {
-		detected, err := m.fetchModelLayers(modelPath)
-		if err != nil {
-			log.Warn().Err(err).Msg("Could not auto-detect layers, using default 32")
-			totalLayers = 32
-		} else {
-			totalLayers = detected
+		if shapeErr == nil && shape.Layers > 0 {
+			totalLayers = shape.Layers
 			log.Info().Int("layers", totalLayers).Msg("Auto-detected model layers")
+		} else {
+			log.Warn().Msg("Could not auto-detect layers, using default 32")
+			totalLayers = 32
 		}
 	}
 
@@ -88,6 +94,20 @@ func (m *ModelManager) loadModelLocked(ctx context.Context, modelID, modelPath s
 		MinLayersPerNode: 1,
 		MemoryPerLayerGB: m.config.MemoryPerLayerGB,
 		ReservedVRAMGB:   m.config.ReservedVRAMGB,
+	}
+	if shapeErr == nil && shape.Usable() {
+		distConfig.Shape = shape
+		distConfig.EmbeddingGB = shape.EmbeddingGB()
+		distConfig.LMHeadGB = shape.LMHeadGB()
+		distConfig.KVCacheReserveGB = shape.KVCacheGBPerToken() * float64(m.kvReserveTokens())
+		log.Info().
+			Float64("per_layer_gb", shape.GBPerLayer()).
+			Float64("embedding_gb", distConfig.EmbeddingGB).
+			Float64("lm_head_gb", distConfig.LMHeadGB).
+			Float64("kv_reserve_gb", distConfig.KVCacheReserveGB).
+			Bool("hybrid", shape.IsHybrid()).
+			Float64("configured_default_gb", m.config.MemoryPerLayerGB).
+			Msg("Sized layers from the model's own config")
 	}
 
 	distribution, err := DistributeLayersProportional(vramMap, distConfig)
@@ -447,6 +467,81 @@ func (m *ModelManager) fetchModelLayers(modelPath string) (int, error) {
 		lastErr = fmt.Errorf("no config endpoint returned a layer count")
 	}
 	return 0, lastErr
+}
+
+// defaultKVReserveTokens is how much context we hold memory back for when the
+// operator has not said otherwise. Small enough not to refuse reasonable
+// models, large enough that an ordinary prompt does not OOM a node that was
+// filled to the brim with weights.
+const defaultKVReserveTokens = 4096
+
+// kvReserveTokens is the context length the KV-cache reserve is sized for.
+// A negative configured value is treated as "use the default"; zero is
+// honoured, so an operator can deliberately reserve nothing.
+func (m *ModelManager) kvReserveTokens() int {
+	if m.config.KVReserveTokens < 0 {
+		return defaultKVReserveTokens
+	}
+	return m.config.KVReserveTokens
+}
+
+// fetchModelShape fetches config.json and parses out everything needed to
+// predict the model's memory cost. Shares the endpoint list and auth handling
+// with fetchModelLayers.
+func (m *ModelManager) fetchModelShape(modelPath string) (ModelShape, error) {
+	urls := []string{
+		fmt.Sprintf("%s/%s/resolve/main/config.json", hfBaseURL, modelPath),
+		fmt.Sprintf("%s/%s/raw/main/config.json", hfBaseURL, modelPath),
+	}
+
+	hfToken := hfTokenFromEnv()
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if hfToken != "" {
+				req.Header.Set("Authorization", "Bearer "+hfToken)
+			}
+			return nil
+		},
+	}
+
+	var lastErr error
+	for _, url := range urls {
+		shape, err := fetchShapeOnce(client, url, hfToken)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return shape, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no config endpoint returned a usable model shape")
+	}
+	return ModelShape{}, lastErr
+}
+
+// fetchShapeOnce performs one config.json request. Split out so the body is
+// closed on every path, as with fetchLayerCount.
+func fetchShapeOnce(client *http.Client, url, hfToken string) (ModelShape, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return ModelShape{}, err
+	}
+	if hfToken != "" {
+		req.Header.Set("Authorization", "Bearer "+hfToken)
+	}
+	req.Header.Set("User-Agent", "hydra-coordinator/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return ModelShape{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ModelShape{}, fmt.Errorf("status %d from %s", resp.StatusCode, url)
+	}
+	return parseModelShape(resp.Body)
 }
 
 // hfTokenFromEnv returns the first HuggingFace token found in the environment.

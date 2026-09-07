@@ -52,7 +52,14 @@ type ClusterConfig struct {
 	HeartbeatInterval  time.Duration `mapstructure:"heartbeat_interval"`
 	UnhealthyThreshold int           `mapstructure:"unhealthy_threshold"`
 	ReservedVRAMGB     float64       `mapstructure:"reserved_vram_gb"`
-	MemoryPerLayerGB   float64       `mapstructure:"memory_per_layer_gb"`
+	// MemoryPerLayerGB is only a fallback. When the model's config can be
+	// read, per-layer cost is derived from the model itself; this constant
+	// cannot be right for every architecture at once.
+	MemoryPerLayerGB float64 `mapstructure:"memory_per_layer_gb"`
+	// KVReserveTokens is the context length that memory is held back for on
+	// every node. Set it to 0 to reserve nothing -- which is how a model can
+	// load into all available memory and then OOM on the first real prompt.
+	KVReserveTokens int `mapstructure:"kv_reserve_tokens"`
 
 	// MaxVRAMGB is the upper bound on per-worker VRAM claims during
 	// registration. Rejects implausible values (including hostile workers
@@ -102,6 +109,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("cluster.unhealthy_threshold", 3)
 	v.SetDefault("cluster.reserved_vram_gb", 2.0)
 	v.SetDefault("cluster.memory_per_layer_gb", 0.5)
+	v.SetDefault("cluster.kv_reserve_tokens", 4096)
 	// 512 GB: generous vs. current top GPUs (~192 GB H200) but still low
 	// enough that a hostile worker can't dominate distribution with a lie.
 	v.SetDefault("cluster.max_vram_gb", 512.0)
