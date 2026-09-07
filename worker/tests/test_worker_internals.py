@@ -57,3 +57,55 @@ def test_worker_config_defaults():
 def test_worker_config_requires_node_and_coordinator():
     with pytest.raises(TypeError):
         DistributedWorkerConfig()  # node_id + coordinator_addr are required
+
+
+# --- hybrid-model KV cache --------------------------------------------------
+
+
+def test_cache_is_built_with_the_model_config_for_hybrid_models():
+    """Qwen3.5's linear-attention layers index the cache by global layer id.
+
+    A DynamicCache built without a config carries no layer entries, so the
+    first linear_attention layer raises IndexError inside update_conv_state.
+    """
+    import types
+
+    from transformers.cache_utils import DynamicCache
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    from hydra_worker.distributed.worker import (
+        DistributedWorker,
+        _cache_accepts_config,
+    )
+
+    if not _cache_accepts_config(DynamicCache):
+        pytest.skip("this transformers version's cache takes no config")
+
+    config = Qwen3_5TextConfig(
+        num_hidden_layers=4,
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=32,
+        layer_types=[
+            "linear_attention",
+            "full_attention",
+            "linear_attention",
+            "full_attention",
+        ],
+    )
+
+    worker = DistributedWorker(
+        DistributedWorkerConfig(node_id="w", coordinator_addr="tcp://127.0.0.1:1")
+    )
+    worker.model = types.SimpleNamespace(config=config)
+    worker.layer_start, worker.layer_end = 0, 4
+
+    cache = worker._get_or_create_cache("seq-1")
+
+    assert isinstance(cache, DynamicCache)
+    assert len(cache.layers) == config.num_hidden_layers, (
+        "cache must be sized for the whole model so global layer indices resolve"
+    )
+    assert worker._get_or_create_cache("seq-1") is cache

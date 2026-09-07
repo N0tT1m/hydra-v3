@@ -17,6 +17,16 @@ from hydra_worker.distributed.pipeline import (
 from hydra_worker.comm.zmq_handler import ZMQHandler
 
 
+def _cache_accepts_config(cache_cls) -> bool:
+    """Whether this transformers version's Cache takes a `config` kwarg."""
+    try:
+        import inspect
+
+        return "config" in inspect.signature(cache_cls.__init__).parameters
+    except (TypeError, ValueError):  # unintrospectable (C-implemented, etc.)
+        return False
+
+
 def _cache_length(cache: Any) -> int:
     """Best-effort past-length probe for a DynamicCache or legacy list cache."""
     if cache is None:
@@ -813,7 +823,20 @@ class DistributedWorker:
             return cache
         try:
             from transformers.cache_utils import DynamicCache
-            cache = DynamicCache()
+
+            # Hybrid decoders (Qwen3.5) mix attention types, and their linear
+            # attention layers look themselves up in the cache by *global*
+            # layer index to fetch recurrent conv/state entries. A cache built
+            # without the config has no layer entries at all, so the very
+            # first such layer raises IndexError. Passing the config lets the
+            # cache size itself for the whole model and give each layer the
+            # right kind of entry -- which also means our slice of layers
+            # indexes correctly, since we keep their global indices.
+            config = getattr(self.model, "config", None)
+            if config is not None and _cache_accepts_config(DynamicCache):
+                cache = DynamicCache(config=config)
+            else:
+                cache = DynamicCache()
         except ImportError:
             cache = [None] * (self.layer_end - self.layer_start)
         self._kv_cache[sequence_id] = cache
