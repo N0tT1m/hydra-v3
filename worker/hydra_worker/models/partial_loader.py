@@ -194,9 +194,19 @@ class PartialTransformer(nn.Module):
             # `past_key_values` (plural) AND the return type changed from a
             # tuple to a bare tensor. Passing the old name was a silent no-op
             # that broke KV-cache accumulation.
+            # Hybrid decoders (Qwen3.5) mix token mixers. A linear_attention
+            # block treats `attention_mask` as a 2D padding mask and feeds it
+            # to apply_mask_to_padding_states, so handing it the 4D causal
+            # mask that full_attention needs blows up on shape. We generate a
+            # dense sequence with no padding, so None is the correct mask for
+            # those layers.
+            layer_mask = attention_mask
+            if getattr(layer, "block_type", None) == "linear_attention":
+                layer_mask = None
+
             layer_outputs = layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=layer_mask,
                 position_ids=position_ids,
                 past_key_values=layer_past,
                 use_cache=use_cache,
