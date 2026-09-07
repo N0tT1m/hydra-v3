@@ -74,7 +74,10 @@ jobs:
             pytest pytest-asyncio pytest-cov
 
       - name: pytest
-        run: python -m pytest worker/tests -v --cov=hydra_worker --cov-report=term
+        # Paths are relative to working-directory, so "worker/tests" resolved
+        # to worker/worker/tests and pytest exited 4 (no tests collected)
+        # rather than running anything.
+        run: python -m pytest tests -v --cov=hydra_worker --cov-report=term
         working-directory: worker
 
   smoke:
