@@ -403,3 +403,143 @@ func TestCleanupRequest_SurvivesAFailedKVCacheBroadcast(t *testing.T) {
 		t.Error("the request should be forgotten even when the broadcast fails")
 	}
 }
+
+// --- forward_error -----------------------------------------------------
+//
+// A worker-side forward failure used to produce nothing at all: the request
+// stayed open and the caller blocked until its own timeout, with the cause
+// only in the worker's log. These pin that it now terminates the sequence.
+
+// failForward feeds a forward_error back as if a worker rejected the sequence.
+func (f *generationFixture) failForward(t *testing.T, fe ForwardError) {
+	t.Helper()
+	f.mgr.HandleForwardError(testutil.Message(zmq.MsgTypeForwardError, "worker-1", fe))
+}
+
+func TestHandleForwardError_TerminatesTheSequence(t *testing.T) {
+	f := newGenerationFixture(t)
+	ch, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-1", NodeID: "worker-1", Error: "boom"})
+
+	var last *InferenceResult
+	for r := range ch {
+		last = r
+	}
+	if last == nil {
+		t.Fatal("stream closed with no terminal result; the caller cannot tell why it ended")
+	}
+	if !last.Finished {
+		t.Error("terminal result should be marked finished")
+	}
+	if last.FinishReason != "worker_error" {
+		t.Errorf("finish_reason = %q, want worker_error", last.FinishReason)
+	}
+}
+
+func TestHandleForwardError_ClearsThePendingRequest(t *testing.T) {
+	f := newGenerationFixture(t)
+	if _, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-1", Error: "boom"})
+
+	if n := f.mgr.PendingCount(); n != 0 {
+		t.Errorf("PendingCount = %d after a forward error, want 0 — the request leaked", n)
+	}
+}
+
+func TestHandleForwardError_CarriesTheWorkersReason(t *testing.T) {
+	f := newGenerationFixture(t)
+	ch, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-1", Error: "no embedding", Reason: "misrouted"})
+
+	var last *InferenceResult
+	for r := range ch {
+		last = r
+	}
+	if last.FinishReason != "misrouted" {
+		t.Errorf("finish_reason = %q, want the worker's own reason", last.FinishReason)
+	}
+}
+
+func TestHandleForwardError_OnlyFailsTheNamedSequence(t *testing.T) {
+	// A forward can fail for reasons specific to one request. Killing every
+	// in-flight generation would be worse than the hang this replaces.
+	f := newGenerationFixture(t)
+	if _, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.mgr.StartGeneration(context.Background(), "seq-2", "hi", nil, defaultGenConfig()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-1", Error: "boom"})
+
+	if n := f.mgr.PendingCount(); n != 1 {
+		t.Errorf("PendingCount = %d, want 1 — the other sequence should survive", n)
+	}
+}
+
+func TestHandleForwardError_UnknownSequenceIsIgnored(t *testing.T) {
+	// The error can race the sequence's own terminator. That must not panic
+	// or disturb anything still running.
+	f := newGenerationFixture(t)
+	if _, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-does-not-exist", Error: "boom"})
+
+	if n := f.mgr.PendingCount(); n != 1 {
+		t.Errorf("PendingCount = %d, want 1", n)
+	}
+}
+
+func TestHandleForwardError_MissingSequenceIDIsIgnored(t *testing.T) {
+	f := newGenerationFixture(t)
+	if _, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.failForward(t, ForwardError{NodeID: "worker-1", Error: "died before it knew the sequence"})
+
+	if n := f.mgr.PendingCount(); n != 1 {
+		t.Errorf("PendingCount = %d, want 1 — a sequence-less error must not fail live work", n)
+	}
+}
+
+func TestHandleForwardError_DeliversEvenWhenTheBufferIsFull(t *testing.T) {
+	// closeWith, not trySend: a terminal marker dropped for want of buffer
+	// space leaves the client with a stream that simply stops.
+	f := newGenerationFixture(t)
+	ch, err := f.mgr.StartGeneration(context.Background(), "seq-1", "hi", nil, defaultGenConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.mgr.mu.RLock()
+	stream := f.mgr.resultChannels["seq-1"]
+	f.mgr.mu.RUnlock()
+	for i := 0; i < resultBufferSize; i++ {
+		stream.trySend(&InferenceResult{TokenID: i})
+	}
+
+	f.failForward(t, ForwardError{SequenceID: "seq-1", Error: "boom"})
+
+	var last *InferenceResult
+	for r := range ch {
+		last = r
+	}
+	if last == nil || !last.Finished || last.FinishReason != "worker_error" {
+		t.Fatalf("terminal result lost on a full buffer: %+v", last)
+	}
+}

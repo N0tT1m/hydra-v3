@@ -103,14 +103,14 @@ func TestLoad_LogDefaults(t *testing.T) {
 	if cfg.Log.Format != "json" {
 		t.Errorf("default log.format = %q, want json", cfg.Log.Format)
 	}
-	if cfg.Log.App != "robin-hydra" {
-		t.Errorf("default log.app = %q, want robin-hydra", cfg.Log.App)
+	if cfg.Log.App != "hydra" {
+		t.Errorf("default log.app = %q, want hydra", cfg.Log.App)
 	}
 }
 
 func TestLoad_LogEnvOverride(t *testing.T) {
 	t.Setenv("HYDRA_LOG_FORMAT", "console")
-	t.Setenv("HYDRA_LOG_APP", "robin-hydra-dev")
+	t.Setenv("HYDRA_LOG_APP", "hydra-dev")
 	cfg, err := Load(filepath.Join(t.TempDir(), "nonexistent.toml"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -118,8 +118,8 @@ func TestLoad_LogEnvOverride(t *testing.T) {
 	if cfg.Log.Format != "console" {
 		t.Errorf("log.format = %q, want console (env override)", cfg.Log.Format)
 	}
-	if cfg.Log.App != "robin-hydra-dev" {
-		t.Errorf("log.app = %q, want robin-hydra-dev (env override)", cfg.Log.App)
+	if cfg.Log.App != "hydra-dev" {
+		t.Errorf("log.app = %q, want hydra-dev (env override)", cfg.Log.App)
 	}
 }
 

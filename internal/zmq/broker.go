@@ -22,6 +22,10 @@ const (
 	MsgTypeInference     MessageType = "inference"
 	MsgTypeForward       MessageType = "forward"
 	MsgTypeForwardResult MessageType = "forward_result"
+	// MsgTypeForwardError is sent by a worker when a forward pass cannot be
+	// completed. Without it a failed forward is silent and the client blocks
+	// until its own timeout with the cause visible only in the worker log.
+	MsgTypeForwardError  MessageType = "forward_error"
 	MsgTypeLoadModel     MessageType = "load_model"
 	MsgTypeModelLoaded   MessageType = "model_loaded"
 	MsgTypeUnloadModel   MessageType = "unload_model"

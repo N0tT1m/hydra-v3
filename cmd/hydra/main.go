@@ -222,7 +222,7 @@ func main() {
 func applyLogging(c config.LogConfig) {
 	app := c.App
 	if app == "" {
-		app = "robin-hydra"
+		app = "hydra"
 	}
 	host, _ := os.Hostname()
 

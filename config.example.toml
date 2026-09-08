@@ -47,4 +47,4 @@ device = "auto"  # auto, cuda:0, cuda:1, mps, cpu
 # format = "console" -> colorized human output on stderr for local dev.
 # HYDRA_LOG_FORMAT / HYDRA_LOG_APP override these.
 format = "json"
-app = "robin-hydra"
+app = "hydra"

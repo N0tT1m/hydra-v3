@@ -135,7 +135,7 @@ func Load(path string) (*Config, error) {
 	// Logging: default to den-den-mushi JSON on stdout so a Dockerized deploy
 	// is captured by the hub forwarder with zero extra wiring.
 	v.SetDefault("log.format", "json")
-	v.SetDefault("log.app", "robin-hydra")
+	v.SetDefault("log.app", "hydra")
 
 	// Config file is optional — callers often pass a conventional path even
 	// when they want pure defaults. Missing is fine; malformed is not.

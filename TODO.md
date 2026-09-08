@@ -56,7 +56,7 @@ The original acceptance criterion still stands: a fixed prompt at
 `temperature=0` yielding byte-identical output across ≥5 consecutive runs, on
 both a small and a large model. Item 4 below is the test that would prove it.
 
-### 2. A failed forward pass hangs the client instead of erroring
+### 2. ~~A failed forward pass hangs the client instead of erroring~~ — FIXED
 
 **Symptom.** When a worker's forward raises, the coordinator never surfaces
 it. The client blocks until its own timeout — observed as a 120s hang, and
@@ -64,6 +64,18 @@ earlier a 10-minute stall, with the error visible only in the worker log.
 
 **Done when:** a worker-side exception terminates the sequence and returns an
 error response promptly; covered by a test that injects a forward failure.
+
+**Fixed.** A `forward_error` message type carries the failure from worker to
+coordinator, which ends that one sequence with a `finish_reason` the caller can
+read. Only the named sequence is failed — a forward can fail for reasons
+specific to one request, and killing every in-flight generation would be worse
+than the hang it replaces.
+
+All four silent returns in `_handle_forward` now report, and the dispatch is
+wrapped so a raised exception does too. Four existing worker tests asserted
+`sent == []` on those paths — they had encoded the bug as intended behaviour —
+and now assert the error is sent. 7 coordinator tests and 7 worker tests cover
+it.
 
 ---
 
@@ -141,12 +153,15 @@ large models fit on fewer nodes — usually a bigger win than splitting them.
 
 ## P3 — housekeeping
 
-### 8. De-brand the default logging
+### 8. ~~De-brand the default logging~~ — PARTLY DONE
 
-`den-den-mushi` and the default app tag `robin-hydra` appear in ~20 places
-across `cmd/hydra/main.go`, `internal/config/config.go`, and
-`worker/hydra_worker/cli.py`. The mechanism (JSON lines on stdout) is
-ordinary; the vocabulary is private and means nothing to an outside reader.
+The default app tag was `robin-hydra`, which names nothing in this repository.
+It is now `hydra` (`hydra-worker` on the worker side), matching the binary and
+the module path.
+
+`den-den-mushi` references remain and are correct: it is the name of the log
+collector these lines are shaped for, and the comments describe a real external
+system rather than decorating this one.
 
 ### 9. Document the operational footguns
 

@@ -141,8 +141,8 @@ func TestApplyLogging_DefaultsAppName(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &entry); err != nil {
 		t.Fatal(err)
 	}
-	if entry["app"] != "robin-hydra" {
-		t.Errorf("app = %v, want the robin-hydra default", entry["app"])
+	if entry["app"] != "hydra" {
+		t.Errorf("app = %v, want the hydra default", entry["app"])
 	}
 }
 

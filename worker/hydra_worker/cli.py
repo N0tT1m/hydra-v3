@@ -17,8 +17,8 @@ if platform.system() == "Windows":
 from hydra_worker.distributed.worker import DistributedWorker, DistributedWorkerConfig
 
 # den-den-mushi app tag for this process. The Go coordinator tags itself
-# "robin-hydra"; the worker gets its own tag so the two are separable in the hub.
-DEFAULT_APP = "robin-hydra-worker"
+# "hydra"; the worker gets its own tag so the two are separable in the hub.
+DEFAULT_APP = "hydra-worker"
 
 
 def _denden_processor(app: str, host: str):

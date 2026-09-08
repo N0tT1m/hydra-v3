@@ -87,6 +87,8 @@ func (c *Coordinator) handleMessage(msg *zmq.Message) {
 		c.handleMetrics(msg)
 	case zmq.MsgTypeForwardResult:
 		c.inferenceManager.HandleForwardResult(msg)
+	case zmq.MsgTypeForwardError:
+		c.inferenceManager.HandleForwardError(msg)
 	case zmq.MsgTypeModelLoaded:
 		c.handleModelLoaded(msg)
 	case zmq.MsgTypeModelUnloaded:

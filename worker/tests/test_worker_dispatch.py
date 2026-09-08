@@ -313,10 +313,17 @@ async def test_topology_without_our_node_changes_nothing():
 
 
 @pytest.mark.asyncio
-async def test_forward_without_a_model_is_ignored():
+async def test_forward_without_a_model_reports_an_error():
+    """Used to assert `sent == []`, which is precisely the hang: the
+    coordinator was told nothing and the caller blocked until it timed out."""
     worker = make_worker()
+
     await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1]})
-    assert worker.zmq_handler.sent == []
+
+    errs = worker.zmq_handler.messages_of_type("forward_error")
+    assert len(errs) == 1
+    assert errs[0]["sequence_id"] == "seq-1"
+    assert errs[0]["reason"] == "no_model"
 
 
 @pytest.mark.asyncio
@@ -337,7 +344,9 @@ async def test_forward_to_a_worker_without_the_embedding_is_refused():
 
     await worker._handle_forward({"sequence_id": "seq-1", "prompt": "hi"})
 
-    assert worker.zmq_handler.sent == []
+    errs = worker.zmq_handler.messages_of_type("forward_error")
+    assert len(errs) == 1
+    assert errs[0]["reason"] == "misrouted"
 
 
 @pytest.mark.asyncio
@@ -398,10 +407,14 @@ async def test_forward_uses_token_ids_directly_when_given():
 
 
 @pytest.mark.asyncio
-async def test_forward_with_nothing_to_run_is_ignored():
+async def test_forward_with_nothing_to_run_reports_an_error():
     worker = make_worker(StubModel(), StubTokenizer())
+
     await worker._handle_forward({"sequence_id": "seq-1"})
-    assert worker.zmq_handler.sent == []
+
+    errs = worker.zmq_handler.messages_of_type("forward_error")
+    assert len(errs) == 1
+    assert errs[0]["reason"] == "empty_request"
 
 
 # --- forward: dispatch ------------------------------------------------------
@@ -701,14 +714,18 @@ async def test_unload_on_a_worker_holding_nothing_is_still_acknowledged():
 
 
 @pytest.mark.asyncio
-async def test_forward_after_unload_is_ignored():
+async def test_forward_after_unload_reports_an_error():
+    """A request that arrives just after an unload is a real race, not a
+    no-op. The caller still needs to be told its sequence is not running."""
     worker = make_worker(StubModel(), StubTokenizer())
     await worker._handle_message({"type": "unload_model", "model_id": "m1"})
     worker.zmq_handler.sent.clear()
 
     await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1]})
 
-    assert worker.zmq_handler.sent == []
+    errs = worker.zmq_handler.messages_of_type("forward_error")
+    assert len(errs) == 1
+    assert errs[0]["reason"] == "no_model"
 
 
 # --- broadcasts and routing -------------------------------------------------
@@ -1342,3 +1359,70 @@ def test_a_budget_larger_than_the_device_does_not_inflate_it():
     info = types.SimpleNamespace(total_memory=27 * 1024**3)
 
     assert worker._advertised_vram_gb(info) == 27.0
+
+
+# --- forward_error ----------------------------------------------------------
+#
+# Every early return in _handle_forward used to log a warning and stop there.
+# The coordinator kept the request open and the caller blocked until its own
+# timeout — 120s in the observed case — with the cause only in this worker's
+# log. These pin that each failure path now reports back.
+
+
+def forward_errors(worker):
+    return worker.zmq_handler.messages_of_type("forward_error")
+
+
+@pytest.mark.asyncio
+async def test_an_exception_in_the_forward_pass_is_reported():
+    # Previously this escaped into the event loop and stranded the sequence in
+    # exactly the same way as the silent returns above.
+    worker = make_worker(model=StubModel(), tokenizer=StubTokenizer())
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("CUDA out of memory")
+
+    worker._run_and_dispatch = boom
+
+    await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1, 2, 3]})
+
+    errs = forward_errors(worker)
+    assert len(errs) == 1
+    assert errs[0]["reason"] == "worker_error"
+    assert "CUDA out of memory" in errs[0]["error"]
+    assert "RuntimeError" in errs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_sequence_reports_nothing():
+    # The coordinator cancelled it, so it already knows. Reporting an error
+    # would surface a failure for work that was deliberately abandoned.
+    worker = make_worker(model=StubModel(), tokenizer=StubTokenizer())
+    worker._cancelled_sequences.add("seq-1")
+
+    await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1, 2, 3]})
+
+    assert forward_errors(worker) == []
+
+
+@pytest.mark.asyncio
+async def test_a_successful_forward_reports_no_error():
+    worker = make_worker(model=StubModel(), tokenizer=StubTokenizer())
+
+    await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1, 2, 3]})
+
+    assert forward_errors(worker) == []
+
+
+@pytest.mark.asyncio
+async def test_a_failure_to_send_the_error_does_not_raise():
+    # Losing the report is bad; replacing it with an unhandled exception in the
+    # event loop is worse.
+    worker = make_worker(model=None)
+
+    async def failing_send(message):
+        raise ConnectionError("socket closed")
+
+    worker.zmq_handler.send = failing_send
+
+    await worker._handle_forward({"sequence_id": "seq-1", "token_ids": [1]})

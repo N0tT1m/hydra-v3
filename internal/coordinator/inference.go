@@ -333,6 +333,80 @@ func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
 }
 
 // ContinueGeneration sends the next token through the pipeline
+// ForwardError is the payload of MsgTypeForwardError: a worker reporting that
+// it cannot complete a forward pass for one sequence.
+type ForwardError struct {
+	SequenceID string `json:"sequence_id"`
+	NodeID     string `json:"node_id"`
+	Error      string `json:"error"`
+	Reason     string `json:"reason,omitempty"`
+}
+
+// HandleForwardError terminates a single sequence whose forward pass failed on
+// a worker.
+//
+// Previously a worker-side failure produced nothing at all: the coordinator
+// held the request open and the client blocked until its own timeout — 120s in
+// the observed case, ten minutes in an earlier one — with the cause visible
+// only in the worker's log. Now the sequence ends promptly with a
+// finish_reason the caller can act on.
+//
+// Only the named sequence is failed. A forward can fail for reasons specific
+// to one request (a cancelled sequence, a bad prompt) and killing every
+// in-flight generation on the cluster would be a far worse outcome than the
+// hang this replaces. Node-wide faults still come through
+// FailRequestsOnNode via the health monitor.
+func (m *InferenceManager) HandleForwardError(msg *zmq.Message) {
+	var fe ForwardError
+	if err := msg.Decode(&fe); err != nil {
+		log.Error().Err(err).Msg("Failed to decode forward error")
+		return
+	}
+
+	if fe.SequenceID == "" {
+		// Nothing to fail. Still worth surfacing: it means a worker hit an
+		// error before it knew which sequence it was serving.
+		log.Error().
+			Str("node_id", fe.NodeID).
+			Str("error", fe.Error).
+			Msg("Worker reported a forward error with no sequence id")
+		return
+	}
+
+	reason := fe.Reason
+	if reason == "" {
+		reason = "worker_error"
+	}
+
+	log.Error().
+		Str("sequence_id", fe.SequenceID).
+		Str("node_id", fe.NodeID).
+		Str("error", fe.Error).
+		Str("reason", reason).
+		Msg("Worker reported a failed forward pass; terminating sequence")
+
+	m.mu.RLock()
+	stream, ok := m.resultChannels[fe.SequenceID]
+	m.mu.RUnlock()
+
+	if !ok {
+		// Already finished or cleaned up; the error raced the terminator.
+		log.Warn().Str("sequence_id", fe.SequenceID).Msg("No pending request for forward error")
+		return
+	}
+
+	// closeWith rather than trySend: this is a terminal marker and must be
+	// delivered even when the buffer is full, or the client sees a stream that
+	// simply stops.
+	stream.closeWith(&InferenceResult{
+		SequenceID:   fe.SequenceID,
+		Finished:     true,
+		FinishReason: reason,
+	})
+
+	m.cleanupRequest(fe.SequenceID)
+}
+
 func (m *InferenceManager) ContinueGeneration(
 	sequenceID string,
 	tokenID int,

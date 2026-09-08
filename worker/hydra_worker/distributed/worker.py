@@ -912,6 +912,36 @@ class DistributedWorker:
     def _has_upstream(self) -> bool:
         return self.zmq_handler is not None and self.zmq_handler.pull is not None
 
+    async def _send_forward_error(
+        self, sequence_id: str, error: str, reason: str = "worker_error"
+    ):
+        """Tell the coordinator a forward pass cannot be completed.
+
+        Every early return in _handle_forward used to log a warning and stop
+        there. The coordinator kept the request open and the caller blocked
+        until its own timeout with the cause visible only in this log. A
+        forward_error terminates the sequence promptly instead.
+        """
+        log.error(
+            "Forward failed; reporting to coordinator",
+            sequence_id=sequence_id,
+            error=error,
+            reason=reason,
+        )
+        try:
+            await self.zmq_handler.send({
+                "type": "forward_error",
+                "node_id": self.config.node_id,
+                "sequence_id": sequence_id,
+                "error": error,
+                "reason": reason,
+            })
+        except Exception as send_err:
+            # Nothing more we can do; the coordinator's health check is the
+            # remaining backstop. Do not raise — that would replace a reported
+            # failure with an unreported one.
+            log.error("Could not send forward_error", error=str(send_err))
+
     async def _handle_forward(self, msg: Dict[str, Any]):
         """Entry point for the coordinator's `forward` command.
 
@@ -921,8 +951,11 @@ class DistributedWorker:
         here — a significant simplification over the old position-based
         dispatch, which would hang in single-worker mode.
         """
+        sequence_id_early = msg.get("sequence_id", "")
         if not self.model:
-            log.warning("Forward request but no model loaded")
+            await self._send_forward_error(
+                sequence_id_early, "no model loaded on this worker", "no_model"
+            )
             return
 
         sequence_id = msg.get("sequence_id", "")
@@ -936,10 +969,10 @@ class DistributedWorker:
             return
 
         if not self.model.has_embedding:
-            log.warning(
-                "Received forward command but this worker has no embedding "
-                "(coordinator routed incorrectly)",
-                sequence_id=sequence_id,
+            await self._send_forward_error(
+                sequence_id,
+                "worker has no embedding layer (coordinator routed incorrectly)",
+                "misrouted",
             )
             return
 
@@ -951,11 +984,24 @@ class DistributedWorker:
             )
 
         if not token_ids:
-            log.warning("No token_ids, messages, or prompt in forward request")
+            await self._send_forward_error(
+                sequence_id,
+                "request carried no token_ids, messages or prompt",
+                "empty_request",
+            )
             return
 
-        input_ids = torch.tensor([token_ids], device=self.device)
-        await self._run_and_dispatch(input_ids, sequence_id, past_len)
+        # Anything raised below this point used to escape into the event loop
+        # and strand the sequence in exactly the same way as the silent
+        # returns above.
+        try:
+            input_ids = torch.tensor([token_ids], device=self.device)
+            await self._run_and_dispatch(input_ids, sequence_id, past_len)
+        except Exception as e:
+            import traceback
+
+            log.error("Forward pass raised", sequence_id=sequence_id, tb=traceback.format_exc())
+            await self._send_forward_error(sequence_id, f"{type(e).__name__}: {e}")
 
     def _tokenize_request(self, messages: List[Dict[str, Any]], prompt: str) -> List[int]:
         """Turn a forward request's messages or prompt into token IDs.
