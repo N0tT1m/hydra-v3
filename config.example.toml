@@ -30,6 +30,21 @@ metrics_addr = "tcp://*:5556"
 broadcast_addr = "tcp://*:5557"
 high_water_mark = 1000
 
+[cache]
+# Prefix caching: keep a finished request's KV cache alive so the next turn of
+# the same conversation prefills only its new tokens. An agent loop appends one
+# turn at a time, so without this its total prefill work grows with the square
+# of the turn count.
+#
+# The cost is VRAM: every retained session holds a full KV cache for as long as
+# it lives. Treat prefix_sessions as a multiplier on the KV budget that
+# cluster.kv_reserve_tokens holds back -- 4 sessions needs room for 4 caches.
+# Set to 0 to disable and clear every cache on completion.
+prefix_sessions = 4
+
+# How long an idle conversation keeps its cache before it is evicted.
+prefix_ttl = "30m"
+
 [model]
 cache_dir = "~/.cache/hydra/models"
 # hf_token = "your_huggingface_token"

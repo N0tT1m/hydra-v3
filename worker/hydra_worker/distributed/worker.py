@@ -8,6 +8,11 @@ import torch
 import structlog
 
 from hydra_worker.core.device import MemoryTracker, detect_device
+from hydra_worker.distributed.prefix_cache import (
+    cache_length,
+    crop_cache_to,
+    plan_prefix_reuse,
+)
 from hydra_worker.models.partial_loader import PartialModelLoader, PartialTransformer
 from hydra_worker.distributed.pipeline import (
     PipelineNode,
@@ -66,25 +71,10 @@ def _cache_accepts_config(cache_cls) -> bool:
         return False
 
 
-def _cache_length(cache: Any) -> int:
-    """Best-effort past-length probe for a DynamicCache or legacy list cache."""
-    if cache is None:
-        return 0
-    if hasattr(cache, "get_seq_length"):
-        try:
-            return int(cache.get_seq_length())
-        except Exception:
-            pass
-    if isinstance(cache, list):
-        for slot in cache:
-            if slot is None:
-                continue
-            if isinstance(slot, tuple) and len(slot) >= 1 and hasattr(slot[0], "shape"):
-                try:
-                    return int(slot[0].shape[-2])
-                except Exception:
-                    return 0
-    return 0
+# Cache-length probing and the prefix-reuse decision live in prefix_cache so
+# they can be tested without a model or a pipeline. Re-exported under the
+# original name because call sites and tests already use it.
+_cache_length = cache_length
 
 log = structlog.get_logger()
 
@@ -161,6 +151,13 @@ class DistributedWorker:
         # generation steps. Without this, each continuation step runs attention
         # against an empty history and produces garbage.
         self._kv_cache: Dict[str, Any] = {}
+
+        # The exact token IDs each cache in _kv_cache was built from, for the
+        # node that owns the embedding (only it ever sees tokens). This is what
+        # makes prefix reuse safe: a new prompt is compared against these
+        # token-for-token, so a caller's claim that two conversations share a
+        # prefix is never taken on trust.
+        self._cache_tokens: Dict[str, List[int]] = {}
 
         self.running = False
 
@@ -540,9 +537,25 @@ class DistributedWorker:
         if sequence_id in self._cancelled_sequences:
             log.info("Dropping hidden states for cancelled sequence", sequence_id=sequence_id)
             return
-        await self._run_and_dispatch(hidden_states, sequence_id, past_len)
+        # Upstream sends `position` — the total sequence length *after* the
+        # forward it just ran. Subtracting the width of what it sent gives the
+        # position its own cache started this step at, and every node in the
+        # pipeline must start this step at the same place. With prefix reuse
+        # in play that is no longer just "whatever I happen to hold": upstream
+        # may have rewound to a shared prefix, and this node has to rewind to
+        # exactly the same point.
+        align_to = max(0, past_len - hidden_states.shape[1])
+        await self._run_and_dispatch(
+            hidden_states, sequence_id, past_len, align_to=align_to
+        )
 
-    async def _run_and_dispatch(self, model_input: torch.Tensor, sequence_id: str, past_len: int):
+    async def _run_and_dispatch(
+        self,
+        model_input: torch.Tensor,
+        sequence_id: str,
+        past_len: int,
+        align_to: Optional[int] = None,
+    ):
         """Unified forward path.
 
         Drives off the loaded model's capabilities (has_embedding / has_lm_head)
@@ -565,6 +578,12 @@ class DistributedWorker:
         We trust the cache over the coordinator.
         """
         cache = self._get_or_create_cache(sequence_id)
+
+        if align_to is not None:
+            cache = await self._align_cache(cache, sequence_id, align_to)
+            if cache is None:
+                return
+
         cache_past_len = _cache_length(cache)
         if cache_past_len != past_len:
             log.debug(
@@ -688,6 +707,51 @@ class DistributedWorker:
                 sequence_id=sequence_id,
             )
 
+    async def _align_cache(self, cache: Any, sequence_id: str, align_to: int):
+        """Rewind this node's cache to the position upstream is forwarding from.
+
+        Returns the cache to use, or None if the sequence has been failed.
+
+        A mismatch here is not cosmetic. Position IDs are derived from the
+        cache length, so a node whose cache is longer or shorter than
+        upstream's would embed every new token at the wrong position and
+        attend against unrelated history — producing fluent, confident,
+        completely wrong output. That is the failure this whole method exists
+        to make impossible, so a mismatch it cannot repair fails the request
+        loudly instead.
+        """
+        have = _cache_length(cache)
+        if have == align_to:
+            return cache
+
+        if align_to == 0:
+            # Upstream started over. Dropping the cache is always available,
+            # and works for the hybrid decoders that cannot be rewound at all.
+            self._kv_cache.pop(sequence_id, None)
+            self._cache_tokens.pop(sequence_id, None)
+            return self._get_or_create_cache(sequence_id)
+
+        if have > align_to and crop_cache_to(cache, align_to):
+            log.info(
+                "Rewound KV cache to match upstream",
+                sequence_id=sequence_id,
+                had=have,
+                now=align_to,
+            )
+            return cache
+
+        await self._send_forward_error(
+            sequence_id,
+            (
+                f"KV cache desync: upstream resumed at {align_to} but this node "
+                f"holds {have} tokens and could not be rewound"
+            ),
+            "cache_desync",
+        )
+        self._kv_cache.pop(sequence_id, None)
+        self._cache_tokens.pop(sequence_id, None)
+        return None
+
     async def _send_sampled_token(self, token_id: int, sequence_id: str):
         """Emit a forward_result for an already-sampled token."""
         token_text = ""
@@ -806,6 +870,7 @@ class DistributedWorker:
             if self.pipeline_node:
                 self.pipeline_node.clear_kv_cache()
             self._kv_cache.clear()
+            self._cache_tokens.clear()
             self._cancelled_sequences.clear()
             log.info("Cleared all KV cache")
             return
@@ -813,6 +878,7 @@ class DistributedWorker:
         if self.pipeline_node:
             self.pipeline_node.clear_kv_cache(sequence_id)
         self._kv_cache.pop(sequence_id, None)
+        self._cache_tokens.pop(sequence_id, None)
 
         if len(self._cancelled_sequences) >= self._cancelled_max:
             self._cancelled_sequences.pop()
@@ -977,11 +1043,20 @@ class DistributedWorker:
             return
 
         token_ids = msg.get("token_ids", [])
-        if not token_ids:
+        is_prefill = not token_ids
+        if is_prefill:
             token_ids = self._tokenize_request(
                 messages=msg.get("messages") or [],
                 prompt=msg.get("prompt", ""),
+                tools=msg.get("tools") or None,
             )
+            if token_ids:
+                token_ids = self._apply_prefix_reuse(sequence_id, token_ids)
+        elif token_ids:
+            # A decode step. The tokens the coordinator feeds back are about to
+            # enter the cache, so the token record has to grow with them or the
+            # next turn's prefix comparison is made against a stale list.
+            self._cache_tokens.setdefault(sequence_id, []).extend(token_ids)
 
         if not token_ids:
             await self._send_forward_error(
@@ -1003,7 +1078,51 @@ class DistributedWorker:
             log.error("Forward pass raised", sequence_id=sequence_id, tb=traceback.format_exc())
             await self._send_forward_error(sequence_id, f"{type(e).__name__}: {e}")
 
-    def _tokenize_request(self, messages: List[Dict[str, Any]], prompt: str) -> List[int]:
+    def _apply_prefix_reuse(self, sequence_id: str, token_ids: List[int]) -> List[int]:
+        """Trim a freshly tokenized prompt to just the part not already cached.
+
+        Returns the tokens that still need to go through the model. The KV
+        cache is left holding exactly the tokens that were dropped, so
+        `_run_and_dispatch` derives the right starting position from it
+        without being told.
+
+        Discarding the cache on a miss is the safe direction: a full prefill is
+        slow, a wrong reuse length is wrong output.
+        """
+        cache = self._kv_cache.get(sequence_id)
+        cached = self._cache_tokens.get(sequence_id)
+
+        reuse = plan_prefix_reuse(cache, cached, token_ids)
+        if reuse <= 0:
+            if cache is not None:
+                log.info(
+                    "Prefix cache miss; re-prefilling",
+                    sequence_id=sequence_id,
+                    cached_tokens=len(cached or []),
+                    prompt_tokens=len(token_ids),
+                )
+            self._kv_cache.pop(sequence_id, None)
+            self._cache_tokens[sequence_id] = list(token_ids)
+            return token_ids
+
+        # The cache now holds exactly token_ids[:reuse]; the record covers the
+        # whole prompt because the remainder is about to be run through.
+        self._cache_tokens[sequence_id] = list(token_ids)
+        log.info(
+            "Prefix cache hit",
+            sequence_id=sequence_id,
+            reused_tokens=reuse,
+            prefill_tokens=len(token_ids) - reuse,
+            saved_fraction=round(reuse / len(token_ids), 3),
+        )
+        return token_ids[reuse:]
+
+    def _tokenize_request(
+        self,
+        messages: List[Dict[str, Any]],
+        prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[int]:
         """Turn a forward request's messages or prompt into token IDs.
 
         Three routes, in descending order of fidelity:
@@ -1029,12 +1148,43 @@ class DistributedWorker:
 
         if messages:
             try:
-                log.info("Applying chat template", n_messages=len(messages))
-                rendered = self.tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
+                log.info(
+                    "Applying chat template",
+                    n_messages=len(messages),
+                    n_tools=len(tools) if tools else 0,
                 )
+                # `tools` is what makes function calling work at all: the
+                # model was trained to emit calls only after its template
+                # rendered the schemas into the prompt. Passing it separately
+                # (rather than pasting JSON into a system message) keeps the
+                # format the model's own template dictates — Qwen3-Coder and
+                # Qwen3-Instruct disagree about it, and the template knows
+                # which one this checkpoint wants.
+                template_kwargs: Dict[str, Any] = {
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                }
+                if tools:
+                    template_kwargs["tools"] = tools
+                try:
+                    rendered = self.tokenizer.apply_chat_template(
+                        messages, **template_kwargs
+                    )
+                except TypeError:
+                    # An older template signature has no `tools` parameter.
+                    # Retrying without it yields a prompt with no schemas —
+                    # the model will not call anything — so this is loud.
+                    if not tools:
+                        raise
+                    log.warning(
+                        "Chat template does not accept tools; tool calling is "
+                        "unavailable for this model",
+                        model=getattr(self, "model_name", None),
+                    )
+                    template_kwargs.pop("tools")
+                    rendered = self.tokenizer.apply_chat_template(
+                        messages, **template_kwargs
+                    )
                 encoded = self.tokenizer(rendered, return_tensors="pt")
                 token_ids = encoded["input_ids"][0].tolist()
                 log.info(
@@ -1071,10 +1221,22 @@ class DistributedWorker:
     @staticmethod
     def _render_messages_plain(messages: List[Dict[str, Any]]) -> str:
         """Last-resort prompt rendering for tokenizers without a template."""
-        lines = [
-            f"{m.get('role', 'user')}: {m.get('content', '')}"
-            for m in messages
-        ]
+        lines = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content") or ""
+            # Tool traffic has no content field worth printing on its own: an
+            # assistant turn that called tools carries them in `tool_calls`,
+            # and dropping those would erase the turn entirely.
+            calls = m.get("tool_calls") or []
+            if calls:
+                rendered_calls = ", ".join(
+                    f"{c.get('function', {}).get('name', '?')}"
+                    f"({c.get('function', {}).get('arguments', '')})"
+                    for c in calls
+                )
+                content = f"{content} [called: {rendered_calls}]".strip()
+            lines.append(f"{role}: {content}")
         lines.append("assistant:")
         return "\n".join(lines)
 

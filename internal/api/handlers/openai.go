@@ -36,6 +36,18 @@ func ChatCompletions(coord *coordinator.Coordinator) gin.HandlerFunc {
 			return
 		}
 
+		// tool_choice is resolved before anything is dispatched: "none" means
+		// the model must not see the schemas at all, and the unsupportable
+		// modes must fail fast rather than after a full generation.
+		useTools, choiceErr := validateToolChoice(req.ToolChoice)
+		if choiceErr != "" {
+			writeError(c, http.StatusBadRequest, "invalid_request_error", choiceErr)
+			return
+		}
+		if !useTools {
+			req.Tools = nil
+		}
+
 		if req.Stream {
 			streamChatCompletion(c, coord, &req)
 		} else {
@@ -47,12 +59,25 @@ func ChatCompletions(coord *coordinator.Coordinator) gin.HandlerFunc {
 // completeChatCompletion handles non-streaming chat completion
 func completeChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *types.ChatCompletionRequest) {
 	requestID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:8])
-	sequenceID := uuid.New().String()
 
 	// Pass messages directly so the worker can apply the model's chat
 	// template. buildPrompt remains as a fallback for clients that preferred
 	// the old ChatML-only behavior (and for tests).
 	messages := convertMessages(req.Messages)
+
+	infMgr := coord.GetInferenceManager()
+
+	// Route the request to a retained KV cache when one covers a prefix of
+	// this conversation, so an agent loop re-prefills only its newest turn.
+	sequenceID, _ := infMgr.BeginSession(messages)
+	completed := false
+	// Any exit that is not a clean completion must release the session, or its
+	// cache is pinned until the TTL reaps it.
+	defer func() {
+		if !completed {
+			infMgr.Sessions().Discard(sequenceID)
+		}
+	}()
 
 	config := coordinator.GenerationConfig{
 		MaxNewTokens:      getMaxTokens(req.MaxTokens),
@@ -64,17 +89,27 @@ func completeChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req 
 		Stream:            false,
 	}
 
-	infMgr := coord.GetInferenceManager()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), nonStreamingTimeout)
 	defer cancel()
 
-	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, "", messages, config)
+	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, "", messages, config, generationOptions(req.Tools)...)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
 
 	text, finishReason, completionTokens := drainGeneration(resultCh, req.Stop)
+
+	// Only parse when tools were actually offered: with none on the table, a
+	// literal "<tool_call>" in the output is prose the client asked for
+	// (documentation about tool calling, say) and must survive verbatim.
+	var toolCalls []types.ToolCall
+	if len(req.Tools) > 0 {
+		text, toolCalls = parseToolCalls(text, req.Tools)
+		if len(toolCalls) > 0 {
+			finishReason = "tool_calls"
+		}
+	}
 
 	// Usage reporting: we don't have a tokenizer in the coordinator, so
 	// approximate with word count across message contents. Clients that
@@ -93,8 +128,9 @@ func completeChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req 
 			{
 				Index: 0,
 				Message: types.ChatMessage{
-					Role:    "assistant",
-					Content: text,
+					Role:      "assistant",
+					Content:   text,
+					ToolCalls: toolCalls,
 				},
 				FinishReason: stringPtr(finishReason),
 			},
@@ -106,6 +142,15 @@ func completeChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req 
 		},
 	}
 
+	// Record what the retained cache now covers: this request plus the turn
+	// just generated from it. That whole span is what the next turn reuses.
+	infMgr.Sessions().Complete(sequenceID, messages, coordinator.ChatMessage{
+		Role:      "assistant",
+		Content:   text,
+		ToolCalls: convertToolCalls(toolCalls),
+	})
+	completed = true
+
 	c.JSON(http.StatusOK, response)
 }
 
@@ -114,10 +159,18 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 	setSSEHeaders(c)
 
 	requestID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:8])
-	sequenceID := uuid.New().String()
 	created := time.Now().Unix()
 
 	messages := convertMessages(req.Messages)
+
+	infMgr := coord.GetInferenceManager()
+	sequenceID, _ := infMgr.BeginSession(messages)
+	completed := false
+	defer func() {
+		if !completed {
+			infMgr.Sessions().Discard(sequenceID)
+		}
+	}()
 
 	config := coordinator.GenerationConfig{
 		MaxNewTokens:      getMaxTokens(req.MaxTokens),
@@ -129,11 +182,10 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 		Stream:            true,
 	}
 
-	infMgr := coord.GetInferenceManager()
 	ctx, cancel := context.WithTimeout(c.Request.Context(), streamingTimeout)
 	defer cancel()
 
-	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, "", messages, config)
+	resultCh, err := infMgr.StartGeneration(ctx, sequenceID, "", messages, config, generationOptions(req.Tools)...)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -159,6 +211,8 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 
 		// Stream tokens from inference
 		var emitted strings.Builder
+		var streamer toolCallStreamer
+		toolsActive := len(req.Tools) > 0
 		finishSent := false
 		for result := range resultCh {
 			select {
@@ -169,6 +223,11 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 			}
 
 			text, stopped := applyStop(&emitted, result.Text, req.Stop)
+			if toolsActive {
+				// Withholds anything that might be an opening tag, and
+				// everything after one actually appears.
+				text = streamer.push(text)
+			}
 			if text != "" {
 				chunk := types.ChatCompletionChunk{
 					ID:      requestID,
@@ -185,11 +244,14 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 					},
 				}
 
-				if result.Finished {
+				// With tools in play the reason is not known until the
+				// buffered text has been parsed for calls, so it is deferred
+				// to the terminal chunk rather than guessed at here.
+				if result.Finished && !toolsActive {
 					chunk.Choices[0].FinishReason = stringPtr(finishReasonOr(result.FinishReason))
 					finishSent = true
 				}
-				if stopped {
+				if stopped && !toolsActive {
 					chunk.Choices[0].FinishReason = stringPtr("stop")
 					finishSent = true
 				}
@@ -198,14 +260,47 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 			}
 
 			if result.Finished || stopped {
+				reason := "stop"
+				if result.Finished {
+					reason = finishReasonOr(result.FinishReason)
+				}
+
+				if toolsActive {
+					// Text held back as a possible tag prefix that never
+					// became one still belongs to the client.
+					flushed, calls := streamer.finish(req.Tools)
+					if flushed != "" {
+						sendSSEChunk(w, types.ChatCompletionChunk{
+							ID:      requestID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []types.ChatChoiceDelta{
+								{Index: 0, Delta: types.ChatMessageDelta{Content: stringPtr(flushed)}},
+							},
+						})
+					}
+					if len(calls) > 0 {
+						for i := range calls {
+							calls[i].Index = indexPtr(i)
+						}
+						sendSSEChunk(w, types.ChatCompletionChunk{
+							ID:      requestID,
+							Object:  "chat.completion.chunk",
+							Created: created,
+							Model:   req.Model,
+							Choices: []types.ChatChoiceDelta{
+								{Index: 0, Delta: types.ChatMessageDelta{ToolCalls: calls}},
+							},
+						})
+						reason = "tool_calls"
+					}
+				}
+
 				// A stop sequence (or a finish with no text) ends the stream
 				// without a chunk to hang the reason on. Clients key off
 				// finish_reason, so emit an empty delta carrying it.
 				if !finishSent {
-					reason := "stop"
-					if result.Finished {
-						reason = finishReasonOr(result.FinishReason)
-					}
 					sendSSEChunk(w, types.ChatCompletionChunk{
 						ID:      requestID,
 						Object:  "chat.completion.chunk",
@@ -219,6 +314,22 @@ func streamChatCompletion(c *gin.Context, coord *coordinator.Coordinator, req *t
 				break
 			}
 		}
+
+		// The retained cache now holds this conversation plus the turn just
+		// streamed. Recording it in the shape the client will replay — parsed
+		// content and tool calls, not the raw scaffolding — is what lets the
+		// next turn match and reuse it.
+		content := emitted.String()
+		var calls []types.ToolCall
+		if toolsActive {
+			content, calls = parseToolCalls(streamer.full.String(), req.Tools)
+		}
+		infMgr.Sessions().Complete(sequenceID, messages, coordinator.ChatMessage{
+			Role:      "assistant",
+			Content:   content,
+			ToolCalls: convertToolCalls(calls),
+		})
+		completed = true
 
 		sendSSEDone(w)
 		return false
@@ -546,9 +657,59 @@ func applyStop(acc *strings.Builder, text string, stop []string) (string, bool) 
 func convertMessages(in []types.ChatMessage) []coordinator.ChatMessage {
 	out := make([]coordinator.ChatMessage, len(in))
 	for i, m := range in {
-		out[i] = coordinator.ChatMessage{Role: m.Role, Content: m.Content}
+		out[i] = coordinator.ChatMessage{
+			Role:       m.Role,
+			Content:    m.Content,
+			ToolCallID: m.ToolCallID,
+			Name:       m.Name,
+		}
+		for _, tc := range m.ToolCalls {
+			out[i].ToolCalls = append(out[i].ToolCalls, coordinator.ToolCall{
+				ID:   tc.ID,
+				Type: tc.Type,
+				Function: coordinator.ToolCallFunction{
+					Name:      tc.Function.Name,
+					Arguments: tc.Function.Arguments,
+				},
+			})
+		}
 	}
 	return out
+}
+
+// convertToolCalls maps HTTP-layer tool calls down to the inference layer, so
+// a generated assistant turn can be recorded in the same shape a client will
+// replay it in on the next request.
+func convertToolCalls(in []types.ToolCall) []coordinator.ToolCall {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]coordinator.ToolCall, len(in))
+	for i, tc := range in {
+		out[i] = coordinator.ToolCall{
+			ID:   tc.ID,
+			Type: tc.Type,
+			Function: coordinator.ToolCallFunction{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		}
+	}
+	return out
+}
+
+// generationOptions renders the request's tools for the worker, which hands
+// them to apply_chat_template. Returns nil when the request offered no usable
+// tools, so the prompt is byte-identical to the pre-tools behaviour.
+func generationOptions(tools []types.Tool) []coordinator.GenerationOption {
+	if len(tools) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return nil
+	}
+	return []coordinator.GenerationOption{coordinator.WithTools(encoded)}
 }
 
 // getMaxTokens returns max tokens with default

@@ -22,6 +22,9 @@ What works today, and what does not.
 | Area | State |
 |------|-------|
 | Text generation (`/v1/chat/completions`, `/v1/completions`) | Working, streaming and non-streaming |
+| Tool calling (`tools`, `tool_calls`, `finish_reason: "tool_calls"`) | Working, streaming and non-streaming |
+| Prefix caching across turns | Working; token-verified, `[cache] prefix_sessions` |
+| `tool_choice` | `"auto"` and `"none"` only; `"required"` and named choices are rejected with 400 |
 | Stop sequences, `temperature=0` greedy decoding, `echo` | Working |
 | Distributed pipeline (embedding -> layers -> lm_head across nodes) | Working |
 | VRAM-proportional layer distribution | Working |
@@ -40,6 +43,29 @@ client fails fast instead of trusting a fabricated response:
 |----------|-----|
 | `/v1/vision/caption`, `/v1/vision/validate`, `/v1/vision/verify` | Needs a vision-language model; the partial loader only handles text decoder architectures |
 | `/v1/images/generate` | Needs a diffusion stack; nothing in `worker/hydra_worker/diffusion/` is written yet |
+
+### Tool calling
+
+`tools` is passed to the loaded model's own chat template, so the prompt
+format is whatever that checkpoint was trained on rather than something
+hardcoded here. Responses are parsed back out of the generated text; both
+formats in circulation are handled — the Hermes/Qwen3-Instruct JSON body and
+the Qwen3-Coder `<function=name><parameter=key>` form. The latter carries no
+types on the wire, so values are coerced back using the JSON Schema in the
+request; a parameter the schema does not declare stays a string rather than
+being guessed at.
+
+Two limits worth knowing before building an agent loop on this:
+
+- **`tool_choice: "required"` and named choices return 400.** Enforcing them
+  needs constrained decoding, which the sampler does not implement. Accepting
+  them and hoping would be the fabricated-response failure the 501s above
+  exist to avoid.
+- **Prefix caching is bounded.** A finished request's KV cache is retained so
+  the next turn of an agent loop reuses the matching prefix instead of
+  re-prefilling from token 0. Only `cache.prefix_sessions` conversations are
+  kept (default 4, `0` disables it) and each expires after `cache.prefix_ttl`,
+  so a loop that fans out wider than that still re-prefills the evicted ones.
 
 The `worker/hydra_worker/{diffusion,training,utils}` and
 `worker/hydra_worker/models/{lora,architecture}` packages are empty namespace

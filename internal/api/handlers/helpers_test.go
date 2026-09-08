@@ -66,6 +66,15 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+// withPrefixCache turns prefix caching on for this fixture. It is off in the
+// default fixture because config.Config is built directly here, without the
+// viper defaults that supply cache.prefix_sessions.
+func (f *fixture) withPrefixCache(sessions int) *fixture {
+	f.t.Helper()
+	f.coord.GetInferenceManager().SetPrefixSessions(sessions, time.Minute)
+	return f
+}
+
 // withWorkers registers healthy worker nodes.
 func (f *fixture) withWorkers(ids ...string) *fixture {
 	f.t.Helper()

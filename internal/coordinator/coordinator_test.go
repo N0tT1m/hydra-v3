@@ -523,7 +523,7 @@ func TestRebalance_LoadFailurePropagates(t *testing.T) {
 func TestInferenceManager_NilTransport(t *testing.T) {
 	mgr := NewInferenceManager(nil, nil)
 
-	if err := mgr.sendForwardRequest("node", "seq", "hi", nil, nil, 0, GenerationConfig{}); err == nil {
+	if err := mgr.sendForwardRequest("node", "seq", "hi", nil, nil, 0, GenerationConfig{}, nil); err == nil {
 		t.Error("sending without a transport should report an error, not panic")
 	}
 	mgr.cleanupRequest("seq")  // must not panic

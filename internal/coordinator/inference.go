@@ -2,6 +2,7 @@ package coordinator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,10 @@ type InferenceManager struct {
 	mu              sync.RWMutex
 	pendingRequests map[string]*InferenceRequest
 	resultChannels  map[string]*resultStream
+
+	// sessions holds the KV caches kept alive between requests so an agent
+	// loop does not re-prefill its whole conversation every turn.
+	sessions *PrefixSessions
 }
 
 // ChatMessage is the role/content pair passed to the worker so it can apply
@@ -109,6 +114,27 @@ type InferenceManager struct {
 type ChatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+
+	// The tool-calling loop. An assistant turn that called tools carries
+	// ToolCalls; the tool's reply carries ToolCallID and Name. Both must
+	// survive back into apply_chat_template or the model cannot see what it
+	// already asked for, and re-asks on every turn.
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// ToolCall is one function invocation emitted by the model. Arguments is a
+// JSON *string* (not an object) to match the OpenAI wire format.
+type ToolCall struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"`
+	Function ToolCallFunction `json:"function"`
+}
+
+type ToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
 }
 
 // InferenceRequest represents an inference request
@@ -135,6 +161,22 @@ type GenerationConfig struct {
 	Stream            bool    `json:"stream"`
 }
 
+// GenerationOption is an optional setting for StartGeneration. It exists as a
+// variadic option rather than another positional parameter so that adding a
+// setting does not churn every call site.
+type GenerationOption func(*generationSettings)
+
+type generationSettings struct {
+	tools json.RawMessage
+}
+
+// WithTools supplies the raw OpenAI `tools` array for this generation. The
+// worker hands it to apply_chat_template, which renders it in whatever format
+// the loaded model was trained on.
+func WithTools(tools json.RawMessage) GenerationOption {
+	return func(s *generationSettings) { s.tools = tools }
+}
+
 // InferenceResult represents a result from the pipeline
 type InferenceResult struct {
 	SequenceID   string    `json:"sequence_id"`
@@ -152,6 +194,44 @@ func NewInferenceManager(broker Sender, modelManager *ModelManager) *InferenceMa
 		modelManager:    modelManager,
 		pendingRequests: make(map[string]*InferenceRequest),
 		resultChannels:  make(map[string]*resultStream),
+		sessions:        NewPrefixSessions(defaultPrefixSessions, defaultPrefixTTL),
+	}
+}
+
+// SetPrefixSessions replaces the session table, so the configured limits (or
+// zero, disabling reuse) take effect.
+func (m *InferenceManager) SetPrefixSessions(max int, ttl time.Duration) {
+	m.sessions = NewPrefixSessions(max, ttl)
+}
+
+// Sessions exposes the prefix-cache table so handlers can open and close a
+// conversation around a generation.
+func (m *InferenceManager) Sessions() *PrefixSessions { return m.sessions }
+
+// BeginSession picks the sequence ID to serve this conversation under, reusing
+// a retained cache when one covers a prefix of it. Any cache evicted to make
+// room is cleared on the workers here — otherwise its VRAM is never returned.
+func (m *InferenceManager) BeginSession(messages []ChatMessage) (sequenceID string, reused bool) {
+	sequenceID, reused, evicted := m.sessions.Acquire(messages)
+	for _, id := range evicted {
+		m.clearWorkerCache(id)
+	}
+	if reused {
+		log.Info().Str("sequence_id", sequenceID).Msg("Continuing a retained KV cache")
+	}
+	return sequenceID, reused
+}
+
+// clearWorkerCache tells every worker to drop a sequence's KV state.
+func (m *InferenceManager) clearWorkerCache(sequenceID string) {
+	if m.broker == nil {
+		return
+	}
+	if err := m.broker.Broadcast(zmq.MsgTypeControl, ClearKVCacheCommand{
+		Type:       "clear_kv_cache",
+		SequenceID: sequenceID,
+	}); err != nil {
+		log.Warn().Err(err).Str("sequence_id", sequenceID).Msg("Failed to broadcast KV cache clear")
 	}
 }
 
@@ -167,7 +247,13 @@ func (m *InferenceManager) StartGeneration(
 	prompt string,
 	messages []ChatMessage,
 	config GenerationConfig,
+	opts ...GenerationOption,
 ) (<-chan *InferenceResult, error) {
+	var settings generationSettings
+	for _, opt := range opts {
+		opt(&settings)
+	}
+
 	model := m.modelManager.GetActiveModel()
 	if model == nil {
 		return nil, fmt.Errorf("no model loaded")
@@ -204,8 +290,8 @@ func (m *InferenceManager) StartGeneration(
 	m.resultChannels[sequenceID] = stream
 	m.mu.Unlock()
 
-	if err := m.sendForwardRequest(firstNodeID, sequenceID, prompt, messages, nil, 0, config); err != nil {
-		m.cleanupRequest(sequenceID)
+	if err := m.sendForwardRequest(firstNodeID, sequenceID, prompt, messages, nil, 0, config, settings.tools); err != nil {
+		m.failRequest(sequenceID)
 		return nil, err
 	}
 
@@ -221,6 +307,7 @@ func (m *InferenceManager) sendForwardRequest(
 	tokenIDs []int,
 	pastLen int,
 	config GenerationConfig,
+	tools json.RawMessage,
 ) error {
 	msg := ForwardRequest{
 		Type:       "forward",
@@ -230,6 +317,7 @@ func (m *InferenceManager) sendForwardRequest(
 		TokenIDs:   tokenIDs,
 		PastLen:    pastLen,
 		Config:     config,
+		Tools:      tools,
 	}
 
 	log.Info().
@@ -307,7 +395,7 @@ func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
 			Finished:     true,
 			FinishReason: "overflow",
 		})
-		m.cleanupRequest(result.SequenceID)
+		m.failRequest(result.SequenceID)
 		return
 	}
 
@@ -328,7 +416,7 @@ func (m *InferenceManager) HandleForwardResult(msg *zmq.Message) {
 			Finished:     true,
 			FinishReason: "error",
 		})
-		m.cleanupRequest(result.SequenceID)
+		m.failRequest(result.SequenceID)
 	}
 }
 
@@ -404,7 +492,7 @@ func (m *InferenceManager) HandleForwardError(msg *zmq.Message) {
 		FinishReason: reason,
 	})
 
-	m.cleanupRequest(fe.SequenceID)
+	m.failRequest(fe.SequenceID)
 }
 
 func (m *InferenceManager) ContinueGeneration(
@@ -421,7 +509,7 @@ func (m *InferenceManager) ContinueGeneration(
 	}
 
 	// Continuation: no prompt/messages — only the freshly-sampled token.
-	return m.sendForwardRequest(req.FirstNodeID, sequenceID, "", nil, []int{tokenID}, pastLen, req.Config)
+	return m.sendForwardRequest(req.FirstNodeID, sequenceID, "", nil, []int{tokenID}, pastLen, req.Config, nil)
 }
 
 // cleanupRequest closes the result stream and broadcasts a KV-cache clear.
@@ -439,22 +527,31 @@ func (m *InferenceManager) cleanupRequest(sequenceID string) {
 		stream.close()
 	}
 
-	// Broadcast is best-effort; missing receivers are non-fatal, and in tests
-	// there may be no transport at all.
-	if m.broker == nil {
+	// A retained session keeps its cache on purpose — clearing here would
+	// throw away the prefix the next turn of this conversation is going to
+	// reuse. Sessions that failed are Discard()ed first, so they are no
+	// longer tracked by the time they reach this point and do get cleared.
+	if m.sessions.IsTracked(sequenceID) {
 		return
 	}
-	if err := m.broker.Broadcast(zmq.MsgTypeControl, ClearKVCacheCommand{
-		Type:       "clear_kv_cache",
-		SequenceID: sequenceID,
-	}); err != nil {
-		log.Warn().Err(err).Str("sequence_id", sequenceID).Msg("Failed to broadcast KV cache clear")
-	}
+
+	// Broadcast is best-effort; missing receivers are non-fatal, and in tests
+	// there may be no transport at all.
+	m.clearWorkerCache(sequenceID)
+}
+
+// failRequest ends a sequence that did not complete normally. Discarding the
+// session before cleanup is what makes cleanupRequest clear the worker cache:
+// a half-finished cache has no reusable prefix, and keeping it would hold VRAM
+// for a conversation that is not coming back.
+func (m *InferenceManager) failRequest(sequenceID string) {
+	m.sessions.Discard(sequenceID)
+	m.cleanupRequest(sequenceID)
 }
 
 // StopGeneration stops an ongoing generation
 func (m *InferenceManager) StopGeneration(sequenceID string) {
-	m.cleanupRequest(sequenceID)
+	m.failRequest(sequenceID)
 }
 
 // FailRequestsOnNode terminates every in-flight request whose pipeline
@@ -503,12 +600,21 @@ func (m *InferenceManager) FailAllRequests(reason string) int {
 	}
 	m.mu.Unlock()
 
+	failed := len(toFail)
 	for id, stream := range toFail {
 		stream.closeWith(&InferenceResult{
 			SequenceID:   id,
 			Finished:     true,
 			FinishReason: reason,
 		})
+	}
+
+	// Every retained cache goes too, not just the in-flight ones. This runs
+	// when the model or the layer topology changed underneath us, and a KV
+	// cache built by the previous model is not merely stale — reused against
+	// new weights it produces fluent nonsense.
+	for _, id := range m.sessions.DiscardAll() {
+		toFail[id] = nil
 	}
 
 	// Best-effort: tell workers to drop any remaining state for these
@@ -521,7 +627,7 @@ func (m *InferenceManager) FailAllRequests(reason string) int {
 			})
 		}
 	}
-	return len(toFail)
+	return failed
 }
 
 // PendingCount returns the number of in-flight generation requests.
@@ -541,6 +647,12 @@ type ForwardRequest struct {
 	TokenIDs   []int            `json:"token_ids,omitempty"`
 	PastLen    int              `json:"past_len"`
 	Config     GenerationConfig `json:"config,omitempty"`
+
+	// Tools is the raw OpenAI `tools` array, passed through verbatim to
+	// tokenizer.apply_chat_template(tools=...). Kept as RawMessage so an
+	// unusual JSON Schema survives the hop without a lossy round-trip
+	// through a Go struct.
+	Tools json.RawMessage `json:"tools,omitempty"`
 }
 
 type ForwardResult struct {

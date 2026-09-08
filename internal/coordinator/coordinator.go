@@ -44,6 +44,9 @@ func New(cfg *config.Config, broker Transport) *Coordinator {
 	registry := cluster.NewRegistry(cfg.Cluster)
 	modelManager := NewModelManager(cfg.Cluster, broker, registry)
 	inferenceManager := NewInferenceManager(broker, modelManager)
+	// Zero sessions means the config explicitly disabled prefix caching; a
+	// zero TTL just means it was not set, and NewPrefixSessions defaults it.
+	inferenceManager.SetPrefixSessions(cfg.Cache.Sessions, cfg.Cache.TTL)
 
 	return &Coordinator{
 		config:           cfg,

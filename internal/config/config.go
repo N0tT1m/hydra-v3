@@ -15,8 +15,25 @@ type Config struct {
 	Auth        AuthConfig        `mapstructure:"auth"`
 	ZMQ         ZMQConfig         `mapstructure:"zmq"`
 	Model       ModelConfig       `mapstructure:"model"`
+	Cache       CacheConfig       `mapstructure:"cache"`
 	LocalWorker LocalWorkerConfig `mapstructure:"local_worker"`
 	Log         LogConfig         `mapstructure:"log"`
+}
+
+// CacheConfig controls prefix caching: keeping a finished request's KV cache
+// alive so the next turn of the same conversation prefills only its new
+// tokens instead of the whole history.
+//
+// The cost is VRAM. Every retained session holds a full KV cache for as long
+// as it lives, so Sessions is effectively a multiplier on the KV budget that
+// cluster.kv_reserve_tokens holds back.
+type CacheConfig struct {
+	// Sessions is how many conversations may keep a cache at once. 0 disables
+	// prefix caching entirely, clearing every cache on completion.
+	Sessions int `mapstructure:"prefix_sessions"`
+	// TTL is how long an idle conversation keeps its cache before it is
+	// evicted and its VRAM returned.
+	TTL time.Duration `mapstructure:"prefix_ttl"`
 }
 
 // LogConfig controls log emission. The default ("json") produces
@@ -123,6 +140,11 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("zmq.metrics_addr", "tcp://*:5556")
 	v.SetDefault("zmq.broadcast_addr", "tcp://*:5557")
 	v.SetDefault("zmq.high_water_mark", 1000)
+
+	// Four concurrent conversations is a deliberately conservative default:
+	// on a cluster sized so one KV cache fits, four do not.
+	v.SetDefault("cache.prefix_sessions", 4)
+	v.SetDefault("cache.prefix_ttl", "30m")
 
 	v.SetDefault("model.cache_dir", "~/.cache/hydra/models")
 	v.SetDefault("model.max_cache_gb", 100)
